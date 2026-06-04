@@ -4,3 +4,11 @@ Cargo.lock
 TODO.md
 DEVELOPMENT_ROADMAP.md
 CLAUDE.md
+
+# rift-kwin (node)
+node_modules/
+rift-kwin/dist/
+rift-kwin/contents/code/main.js
+
+# local planning + upstream reference checkouts (not project content)
+tasks/

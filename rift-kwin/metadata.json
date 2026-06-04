@@ -1,0 +1,14 @@
+{
+  "KPlugin": {
+    "Id": "rift-kwin",
+    "Name": "Rift",
+    "Description": "Thin KWin agent for the Rift tiling daemon",
+    "Version": "0.1.0",
+    "License": "MIT",
+    "Authors": [{ "Name": "Rift" }],
+    "EnabledByDefault": false
+  },
+  "X-Plasma-API": "javascript",
+  "X-Plasma-MainScript": "code/main.js",
+  "KPackageStructure": "KWin/Script"
+}

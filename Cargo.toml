@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["crates/rift-ipc", "crates/riftd", "crates/riftctl"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+repository = "https://github.com/ghostkellz/rift"
+
+[workspace.dependencies]
+rift-ipc = { path = "crates/rift-ipc" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+notify = "7"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "time"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

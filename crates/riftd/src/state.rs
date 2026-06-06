@@ -34,7 +34,7 @@ pub struct Cell {
 }
 
 /// The daemon's reconciled view of the world.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct State {
     cells: HashMap<CellKey, Cell>,
     default_layout: LayoutKind,
@@ -46,8 +46,31 @@ pub struct State {
     /// Session behavior flags from config. Stored and surfaced; their runtime
     /// effects are deferred (see the milestone notes).
     behavior: BehaviorConfig,
+    /// Whether global auto-tiling is enabled. When false, [`State::geometry`]
+    /// emits nothing so every window floats where KWin last left it.
+    tiling_enabled: bool,
+    /// Windows the user has explicitly floated; the layout engine skips them.
+    /// Pruned to the live topology on every reconcile.
+    floating_windows: HashSet<WindowId>,
     /// The most recent topology, retained so [`State::reset`] can rebuild.
     last_topology: Topology,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        // `tiling_enabled` must default to `true`; the derived bool default is
+        // `false`, which would silently ship with tiling off.
+        Self {
+            cells: HashMap::new(),
+            default_layout: LayoutKind::default(),
+            params: LayoutParams::default(),
+            focused: None,
+            behavior: BehaviorConfig::default(),
+            tiling_enabled: true,
+            floating_windows: HashSet::new(),
+            last_topology: Topology::default(),
+        }
+    }
 }
 
 impl State {
@@ -133,6 +156,10 @@ impl State {
             self.focused = None;
         }
 
+        // Floating marks cannot outlive their windows either.
+        let live_windows: HashSet<&WindowId> = topology.windows.iter().map(|w| &w.id).collect();
+        self.floating_windows.retain(|w| live_windows.contains(w));
+
         self.last_topology = topology.clone();
         self.report()
     }
@@ -151,6 +178,11 @@ impl State {
     /// emitted in topology order so the output is deterministic. Windows whose
     /// cell imposes no geometry (e.g. floating) are simply absent.
     pub fn geometry(&self) -> GeometrySet {
+        // Auto-tiling off: emit nothing so every window floats untouched.
+        if !self.tiling_enabled {
+            return GeometrySet::default();
+        }
+
         let output_rects: HashMap<&OutputId, Rect> = self
             .last_topology
             .outputs
@@ -163,7 +195,14 @@ impl State {
             let Some(&area) = output_rects.get(&key.output) else {
                 continue;
             };
-            for wg in layout::arrange(cell.layout, &cell.windows, area, &self.params) {
+            // Floated windows are excluded from the layout; the rest re-tile.
+            let tiled: Vec<WindowId> = cell
+                .windows
+                .iter()
+                .filter(|w| !self.floating_windows.contains(*w))
+                .cloned()
+                .collect();
+            for wg in layout::arrange(cell.layout, &tiled, area, &self.params) {
                 placed.insert(wg.id, wg.rect);
             }
         }
@@ -258,6 +297,25 @@ impl State {
         true
     }
 
+    /// Flip global auto-tiling. Returns the new enabled state.
+    pub fn toggle_tiling(&mut self) -> bool {
+        self.tiling_enabled = !self.tiling_enabled;
+        self.tiling_enabled
+    }
+
+    /// Toggle the floating state of `window` (or the focused window when
+    /// `None`). A floated window is skipped by the layout engine. Returns the
+    /// new floating state, or `None` when no window could be resolved.
+    pub fn toggle_float(&mut self, window: Option<WindowId>) -> Option<bool> {
+        let target = window.or_else(|| self.focused.clone())?;
+        if self.floating_windows.remove(&target) {
+            Some(false)
+        } else {
+            self.floating_windows.insert(target);
+            Some(true)
+        }
+    }
+
     /// Adjust the master-area ratio, clamped to a usable range.
     pub fn adjust_master_ratio(&mut self, delta: f32) {
         self.params.master_ratio = (self.params.master_ratio + delta).clamp(0.05, 0.95);
@@ -280,6 +338,7 @@ impl State {
         self.params.master_count = cfg.layout.master_count;
         self.params.gaps_inner = cfg.gaps.inner;
         self.params.gaps_outer = cfg.gaps.outer;
+        self.tiling_enabled = cfg.layout.tiling_enabled;
         self.behavior = cfg.behavior.clone();
     }
 
@@ -297,6 +356,7 @@ impl State {
             per_desktop: self.behavior.per_desktop,
             per_activity: self.behavior.per_activity,
             focus_follows_mouse: self.behavior.focus_follows_mouse,
+            tiling_enabled: self.tiling_enabled,
             source,
             loaded,
         }
@@ -586,6 +646,7 @@ mod tests {
                 default: LayoutKind::Monocle,
                 master_ratio: 0.7,
                 master_count: 3,
+                tiling_enabled: true,
             },
             gaps: GapsConfig { inner: 0, outer: 0 },
             behavior: BehaviorConfig {
@@ -640,6 +701,7 @@ mod tests {
                 default: LayoutKind::Spiral,
                 master_ratio: 0.5,
                 master_count: 2,
+                tiling_enabled: true,
             },
             gaps: GapsConfig {
                 inner: 4,
@@ -655,6 +717,81 @@ mod tests {
         assert_eq!(report.gaps_outer, 16);
         assert_eq!(report.source, "/tmp/riftrc");
         assert!(report.loaded);
+    }
+
+    /// Tiling defaults on; toggling it off empties the geometry, and toggling
+    /// it back on re-tiles.
+    #[test]
+    fn toggle_tiling_gates_geometry() {
+        let mut state = two_window_state();
+        assert!(!state.geometry().windows.is_empty());
+
+        assert!(!state.toggle_tiling()); // now disabled
+        assert!(state.geometry().windows.is_empty());
+
+        assert!(state.toggle_tiling()); // re-enabled
+        assert_eq!(state.geometry().windows.len(), 2);
+    }
+
+    /// Floating the focused window removes it from the layout; the rest re-tile.
+    #[test]
+    fn toggle_float_excludes_window_from_layout() {
+        let mut state = two_window_state();
+        state.set_focus(Some("w1".into()));
+
+        assert_eq!(state.toggle_float(None), Some(true));
+        let geom = state.geometry();
+        assert!(geom.windows.iter().all(|g| g.id != "w1".into()));
+        // The single remaining tiled window fills the cell.
+        assert_eq!(geom.windows.len(), 1);
+        assert_eq!(geom.windows[0].id, "w2".into());
+
+        // Toggling again un-floats it.
+        assert_eq!(state.toggle_float(Some("w1".into())), Some(false));
+        assert_eq!(state.geometry().windows.len(), 2);
+    }
+
+    /// `toggle_float(None)` with nothing focused resolves no target.
+    #[test]
+    fn toggle_float_without_focus_is_none() {
+        let mut state = two_window_state();
+        assert_eq!(state.toggle_float(None), None);
+    }
+
+    /// A floated window that closes is pruned from the floating set on reconcile.
+    #[test]
+    fn reconcile_prunes_closed_floating_window() {
+        let mut state = two_window_state();
+        assert_eq!(state.toggle_float(Some("w2".into())), Some(true));
+
+        state.reconcile(&Topology {
+            outputs: vec![output("o1")],
+            desktops: vec![desktop("d1")],
+            activities: vec![activity("a1")],
+            windows: vec![window("w1", "o1", "d1", "a1")],
+        });
+
+        // w2 is gone; re-adding it must start un-floated (clean prune).
+        assert!(!state.floating_windows.contains(&"w2".into()));
+    }
+
+    /// `apply_config` carries `tiling_enabled` through to the running state.
+    #[test]
+    fn apply_config_sets_tiling_enabled() {
+        use crate::config::{BehaviorConfig, Config, GapsConfig, LayoutConfig};
+
+        let mut state = two_window_state();
+        state.apply_config(&Config {
+            layout: LayoutConfig {
+                default: LayoutKind::Tile,
+                master_ratio: 0.6,
+                master_count: 1,
+                tiling_enabled: false,
+            },
+            gaps: GapsConfig::default(),
+            behavior: BehaviorConfig::default(),
+        });
+        assert!(state.geometry().windows.is_empty());
     }
 
     /// Focus cannot survive its window being removed from the topology.

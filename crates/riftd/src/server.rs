@@ -95,6 +95,14 @@ impl Daemon {
                     self.state.adjust_master_count(delta);
                     Reply::Geometry(self.state.geometry())
                 }
+                Command::ToggleTiling => {
+                    self.state.toggle_tiling();
+                    Reply::Geometry(self.state.geometry())
+                }
+                Command::ToggleFloat { window } => {
+                    self.state.toggle_float(window);
+                    Reply::Geometry(self.state.geometry())
+                }
                 Command::GetConfig => Reply::Config(self.config_report()),
                 Command::Reload => match self.reload() {
                     Ok(()) => {
@@ -373,6 +381,62 @@ mod tests {
                 assert_eq!(r.windows, 1);
             }
             other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggle_tiling_gates_geometry_over_dispatch() {
+        let mut d = daemon();
+        let topo = json!({
+            "type": "Topology",
+            "outputs": [{
+                "id": "o1", "name": "o1",
+                "rect": { "x": 0, "y": 0, "width": 1920, "height": 1080 }
+            }],
+            "desktops": [{ "id": "d1", "name": "d1" }],
+            "activities": [{ "id": "a1", "name": "a1" }],
+            "windows": [
+                { "id": "w1", "output": "o1", "desktop": "d1", "activity": "a1" },
+                { "id": "w2", "output": "o1", "desktop": "d1", "activity": "a1" }
+            ]
+        });
+        assert!(matches!(d.dispatch(topo), Reply::Geometry(set) if set.windows.len() == 2));
+
+        match d.dispatch(json!({ "type": "ToggleTiling" })) {
+            Reply::Geometry(set) => assert!(set.windows.is_empty()),
+            other => panic!("expected empty Geometry, got {other:?}"),
+        }
+        match d.dispatch(json!({ "type": "ToggleTiling" })) {
+            Reply::Geometry(set) => assert_eq!(set.windows.len(), 2),
+            other => panic!("expected Geometry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggle_float_excludes_focused_over_dispatch() {
+        let mut d = daemon();
+        let topo = json!({
+            "type": "Topology",
+            "outputs": [{
+                "id": "o1", "name": "o1",
+                "rect": { "x": 0, "y": 0, "width": 1920, "height": 1080 }
+            }],
+            "desktops": [{ "id": "d1", "name": "d1" }],
+            "activities": [{ "id": "a1", "name": "a1" }],
+            "windows": [
+                { "id": "w1", "output": "o1", "desktop": "d1", "activity": "a1" },
+                { "id": "w2", "output": "o1", "desktop": "d1", "activity": "a1" }
+            ]
+        });
+        d.dispatch(topo);
+        d.dispatch(json!({ "type": "Focus", "window": "w1" }));
+
+        match d.dispatch(json!({ "type": "ToggleFloat", "window": null })) {
+            Reply::Geometry(set) => {
+                assert_eq!(set.windows.len(), 1);
+                assert_eq!(set.windows[0].id, "w2".into());
+            }
+            other => panic!("expected Geometry, got {other:?}"),
         }
     }
 

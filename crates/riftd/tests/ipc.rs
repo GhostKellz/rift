@@ -224,6 +224,65 @@ async fn config_loads_then_reload_reflects_rewrite() {
 }
 
 #[tokio::test]
+async fn toggle_tiling_round_trips_over_socket() {
+    let (socket, _dir, _stop) = spawn_server().await;
+    let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+    let topo = Topology {
+        outputs: vec![Output {
+            id: "o1".into(),
+            name: "o1".into(),
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        }],
+        desktops: vec![Desktop {
+            id: "d1".into(),
+            name: "d1".into(),
+        }],
+        activities: vec![Activity {
+            id: "a1".into(),
+            name: "a1".into(),
+        }],
+        windows: vec![
+            Window {
+                id: "w1".into(),
+                output: "o1".into(),
+                desktop: "d1".into(),
+                activity: "a1".into(),
+            },
+            Window {
+                id: "w2".into(),
+                output: "o1".into(),
+                desktop: "d1".into(),
+                activity: "a1".into(),
+            },
+        ],
+    };
+    write_frame(&mut stream, &Event::Topology(topo))
+        .await
+        .unwrap();
+    let reply: Reply = read_frame(&mut stream).await.unwrap();
+    assert!(matches!(reply, Reply::Geometry(set) if set.windows.len() == 2));
+
+    // Disabling tiling empties the geometry; re-enabling re-tiles.
+    write_frame(&mut stream, &Command::ToggleTiling)
+        .await
+        .unwrap();
+    let reply: Reply = read_frame(&mut stream).await.unwrap();
+    assert!(matches!(reply, Reply::Geometry(set) if set.windows.is_empty()));
+
+    write_frame(&mut stream, &Command::ToggleTiling)
+        .await
+        .unwrap();
+    let reply: Reply = read_frame(&mut stream).await.unwrap();
+    assert!(matches!(reply, Reply::Geometry(set) if set.windows.len() == 2));
+}
+
+#[tokio::test]
 async fn unknown_message_errors() {
     let (socket, _dir, _stop) = spawn_server().await;
 

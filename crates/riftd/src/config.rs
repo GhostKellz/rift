@@ -33,6 +33,8 @@ pub struct LayoutConfig {
     pub master_ratio: f32,
     /// Number of windows in the master region.
     pub master_count: usize,
+    /// Whether global auto-tiling starts enabled.
+    pub tiling_enabled: bool,
 }
 
 impl Default for LayoutConfig {
@@ -41,6 +43,7 @@ impl Default for LayoutConfig {
             default: LayoutKind::default(),
             master_ratio: 0.6,
             master_count: 1,
+            tiling_enabled: true,
         }
     }
 }
@@ -182,6 +185,14 @@ mod tests {
         assert_eq!(cfg.gaps.outer, 16);
         assert!(!cfg.behavior.per_desktop);
         assert!(cfg.behavior.focus_follows_mouse);
+    }
+
+    #[test]
+    fn tiling_enabled_defaults_true_and_can_be_disabled() {
+        assert!(LayoutConfig::default().tiling_enabled);
+        let f = write_tmp("[layout]\ntiling_enabled = false\n");
+        let cfg = Config::load(f.path()).unwrap();
+        assert!(!cfg.layout.tiling_enabled);
     }
 
     #[test]

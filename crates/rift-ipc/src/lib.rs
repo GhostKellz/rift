@@ -203,6 +203,12 @@ pub enum Command {
     MasterRatio { delta: f32 },
     /// Adjust the master-window count by `delta` (never below one).
     MasterCount { delta: i32 },
+    /// Toggle global auto-tiling. When off, the daemon emits no geometry so
+    /// every window floats where KWin last left it.
+    ToggleTiling,
+    /// Toggle the floating state of a window (`None` targets the focused
+    /// window). A floating window is skipped by the layout engine.
+    ToggleFloat { window: Option<WindowId> },
     /// Re-read the config file from disk and apply it.
     Reload,
     /// Report the daemon's effective configuration.
@@ -268,6 +274,8 @@ pub struct ConfigReport {
     pub per_activity: bool,
     /// Whether focus follows the mouse pointer (effect deferred).
     pub focus_follows_mouse: bool,
+    /// Whether global auto-tiling is currently enabled.
+    pub tiling_enabled: bool,
     /// Path the config was resolved from.
     pub source: String,
     /// Whether a config file was found and loaded (vs built-in defaults).
@@ -523,6 +531,42 @@ mod tests {
     }
 
     #[test]
+    fn toggle_commands_serialize_with_type_tag() {
+        assert_eq!(
+            serde_json::to_string(&Command::ToggleTiling).unwrap(),
+            r#"{"type":"ToggleTiling"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Command::ToggleFloat { window: None }).unwrap(),
+            r#"{"type":"ToggleFloat","window":null}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Command::ToggleFloat {
+                window: Some(WindowId::from("w3"))
+            })
+            .unwrap(),
+            r#"{"type":"ToggleFloat","window":"w3"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn round_trip_toggle_commands() {
+        for cmd in [
+            Command::ToggleTiling,
+            Command::ToggleFloat { window: None },
+            Command::ToggleFloat {
+                window: Some(WindowId::from("w9")),
+            },
+        ] {
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &cmd).await.unwrap();
+            let mut cursor = std::io::Cursor::new(buf);
+            let got: Command = read_frame(&mut cursor).await.unwrap();
+            assert_eq!(got, cmd);
+        }
+    }
+
+    #[test]
     fn config_commands_serialize_with_type_tag() {
         assert_eq!(
             serde_json::to_string(&Command::Reload).unwrap(),
@@ -545,6 +589,7 @@ mod tests {
             per_desktop: true,
             per_activity: false,
             focus_follows_mouse: true,
+            tiling_enabled: true,
             source: "/tmp/riftrc".into(),
             loaded: true,
         };

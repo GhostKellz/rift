@@ -84,6 +84,8 @@ export type Command =
   | { type: "SetLayout"; layout: LayoutKind }
   | { type: "MasterRatio"; delta: number }
   | { type: "MasterCount"; delta: number }
+  | { type: "ToggleTiling" }
+  | { type: "ToggleFloat"; window: string | null }
   | { type: "GetConfig" }
   | { type: "Reload" };
 
@@ -114,6 +116,7 @@ export interface ConfigReport {
   per_desktop: boolean;
   per_activity: boolean;
   focus_follows_mouse: boolean;
+  tiling_enabled: boolean;
   source: string;
   loaded: boolean;
 }

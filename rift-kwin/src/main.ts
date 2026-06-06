@@ -123,12 +123,28 @@ const BINDINGS: Binding[] = [
   moveBind("j", "Down"),
   moveBind("k", "Up"),
   moveBind("l", "Right"),
-  layoutBind("t", "Tile"),
+  // Tile (Meta+T) and ThreeColumn (Meta+D) collide with KDE defaults
+  // (Show Desktop et al.), which KGlobalAccel silently drops — use Shift.
+  layoutBind("t", "Tile", "Meta+Shift+T"),
   layoutBind("m", "Monocle"),
   layoutBind("c", "Columns"),
   layoutBind("s", "Spiral"),
-  layoutBind("d", "ThreeColumn"),
+  layoutBind("d", "ThreeColumn", "Meta+Shift+D"),
   layoutBind("f", "Floating"),
+  {
+    id: "rift_toggle_tiling",
+    text: "Rift: Toggle auto-tiling",
+    key: "Meta+Y",
+    command: { type: "ToggleTiling" },
+  },
+  {
+    // Meta+G is KDE's "Toggle Grid View"; Meta+Shift+Space is free and matches
+    // the i3/sway float-toggle convention.
+    id: "rift_toggle_float",
+    text: "Rift: Toggle float (focused)",
+    key: "Meta+Shift+Space",
+    command: { type: "ToggleFloat", window: null },
+  },
   {
     id: "rift_master_ratio_dec",
     text: "Rift: Shrink master area",
@@ -173,11 +189,11 @@ function moveBind(letter: string, direction: Direction): Binding {
   };
 }
 
-function layoutBind(letter: string, layout: LayoutKind): Binding {
+function layoutBind(letter: string, layout: LayoutKind, key?: string): Binding {
   return {
     id: `rift_layout_${layout.toLowerCase()}`,
     text: `Rift: ${layout} layout`,
-    key: `Meta+${letter.toUpperCase()}`,
+    key: key ?? `Meta+${letter.toUpperCase()}`,
     command: { type: "SetLayout", layout },
   };
 }

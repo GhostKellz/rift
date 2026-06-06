@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use rift_ipc::{
-    Command as IpcCommand, Direction, LayoutKind, Reply, default_socket_path, read_frame,
+    Command as IpcCommand, Direction, LayoutKind, Reply, WindowId, default_socket_path, read_frame,
     write_frame,
 };
 use tokio::net::UnixStream;
@@ -46,6 +46,13 @@ enum Cmd {
     MasterRatio { delta: f32 },
     /// Adjust the master window count by a signed delta.
     MasterCount { delta: i32 },
+    /// Toggle global auto-tiling on or off.
+    ToggleTiling,
+    /// Toggle the floating state of a window (defaults to the focused window).
+    ToggleFloat {
+        /// Window id to float/unfloat; omit to target the focused window.
+        window: Option<String>,
+    },
     /// Print the daemon's effective configuration.
     Config,
     /// Re-read the config from disk and apply it.
@@ -125,6 +132,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::MasterRatio { delta } => relayout(&socket, IpcCommand::MasterRatio { delta }).await,
         Cmd::MasterCount { delta } => relayout(&socket, IpcCommand::MasterCount { delta }).await,
+        Cmd::ToggleTiling => relayout(&socket, IpcCommand::ToggleTiling).await,
+        Cmd::ToggleFloat { window } => {
+            relayout(
+                &socket,
+                IpcCommand::ToggleFloat {
+                    window: window.map(WindowId),
+                },
+            )
+            .await
+        }
         Cmd::Config => config(&socket, IpcCommand::GetConfig).await,
         Cmd::Reload => config(&socket, IpcCommand::Reload).await,
     }
@@ -196,6 +213,7 @@ async fn config(socket: &std::path::Path, cmd: IpcCommand) -> anyhow::Result<()>
                 c.master_ratio, c.master_count
             );
             println!("gaps:     inner {}, outer {}", c.gaps_inner, c.gaps_outer);
+            println!("tiling:   {}", if c.tiling_enabled { "on" } else { "off" });
             println!(
                 "behavior: per_desktop {}, per_activity {}, focus_follows_mouse {}",
                 c.per_desktop, c.per_activity, c.focus_follows_mouse

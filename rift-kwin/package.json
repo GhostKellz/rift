@@ -6,7 +6,7 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "build": "esbuild src/main.ts --bundle --format=iife --target=es2019 --outfile=contents/code/main.js",
+    "build": "esbuild src/main.ts --bundle --format=iife --target=es2017 --outfile=contents/code/main.js",
     "build:harness": "esbuild src/protocol.ts --bundle --format=esm --target=es2020 --outfile=dist/protocol.mjs",
     "typecheck": "tsc --noEmit",
     "test": "npm run build:harness && node --test test/handshake.test.mjs"

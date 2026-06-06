@@ -33,20 +33,27 @@ Swap the focused window with its neighbor in a direction.
 
 Switch the focused cell's layout.
 
-| Shortcut  | Layout       |
-| --------- | ------------ |
-| `Meta+T`  | tile         |
-| `Meta+M`  | monocle      |
-| `Meta+C`  | columns      |
-| `Meta+S`  | spiral       |
-| `Meta+D`  | threecolumn  |
-| `Meta+F`  | floating     |
+| Shortcut         | Layout       |
+| ---------------- | ------------ |
+| `Meta+Shift+T`   | tile         |
+| `Meta+M`         | monocle      |
+| `Meta+C`         | columns      |
+| `Meta+S`         | spiral       |
+| `Meta+Shift+D`   | threecolumn  |
+| `Meta+F`         | floating     |
+
+`Meta+T` (Show Desktop) and `Meta+D` (Minimize All) are KDE defaults that
+KGlobalAccel silently drops on collision, so tile and threecolumn use the
+`Shift` variants.
 
 ## Master area
 
 | Shortcut             | Action                  |
 | -------------------- | ----------------------- |
-| `Meta+Minus`         | Shrink master area      |
-| `Meta+Equal`         | Grow master area        |
-| `Meta+Shift+Comma`   | Fewer master windows    |
-| `Meta+Shift+Period`  | More master windows     |
+| `Meta+Shift+-`       | Shrink master area      |
+| `Meta+Shift+=`       | Grow master area        |
+| `Meta+Shift+,`       | Fewer master windows    |
+| `Meta+Shift+.`       | More master windows     |
+
+`Meta+Minus`/`Meta+Equal` are KDE's desktop "Zoom Out/In", so the master-ratio
+shortcuts use the `Shift` variants.

@@ -59,8 +59,20 @@ export function collectTopology(): Topology {
 /**
  * Begin a session over the given transport: announce ourselves and react to
  * the daemon's reply. Pure protocol — no I/O or framing lives here.
+ *
+ * Returns a `resync` callback the caller drives on every liveness tick (window
+ * events and the heartbeat). While the handshake is unacknowledged — the daemon
+ * was down at load or has restarted — `resync` re-sends `Hello`; once acked it
+ * pushes topology. D-Bus failures are silent, so retrying the handshake until an
+ * `Ack` lands is what recovers a late or restarted daemon without a reload.
  */
-export function start(transport: Transport, kwinVersion: string): void {
+export function start(transport: Transport, kwinVersion: string): () => void {
+  const hello: Hello = {
+    type: "Hello",
+    kwin_version: kwinVersion,
+    protocol: PROTOCOL_VERSION,
+  };
+
   // Hello and Focus events both reply with `Ack`; only the first (the handshake
   // acknowledgement) should wire up shortcuts, focus reporting, and topology.
   let helloAcked = false;
@@ -93,12 +105,15 @@ export function start(transport: Transport, kwinVersion: string): void {
     }
   });
 
-  const hello: Hello = {
-    type: "Hello",
-    kwin_version: kwinVersion,
-    protocol: PROTOCOL_VERSION,
-  };
   transport.send(hello);
+
+  return () => {
+    if (helloAcked) {
+      pushTopology(transport);
+    } else {
+      transport.send(hello);
+    }
+  };
 }
 
 /** Default keybindings: command sent to the daemon for each shortcut. */
@@ -146,27 +161,33 @@ const BINDINGS: Binding[] = [
     command: { type: "ToggleFloat", window: null },
   },
   {
+    // Meta+Minus/Equal are KDE's "Zoom Out/In" (desktop zoom); use Shift to
+    // match master_count on Meta+Shift+Comma/Period and avoid the collision.
+    // Use the literal "-"/"=" glyphs: QKeySequence has no "Minus"/"Equal" key
+    // names, so those strings parse to Qt::Key_unknown and never bind.
     id: "rift_master_ratio_dec",
     text: "Rift: Shrink master area",
-    key: "Meta+Minus",
+    key: "Meta+Shift+-",
     command: { type: "MasterRatio", delta: -0.05 },
   },
   {
     id: "rift_master_ratio_inc",
     text: "Rift: Grow master area",
-    key: "Meta+Equal",
+    key: "Meta+Shift+=",
     command: { type: "MasterRatio", delta: 0.05 },
   },
   {
+    // Glyphs, not "Comma"/"Period": QKeySequence portable text has no key names
+    // for punctuation, so the words parse to an empty/unknown sequence.
     id: "rift_master_count_dec",
     text: "Rift: Fewer master windows",
-    key: "Meta+Shift+Comma",
+    key: "Meta+Shift+,",
     command: { type: "MasterCount", delta: -1 },
   },
   {
     id: "rift_master_count_inc",
     text: "Rift: More master windows",
-    key: "Meta+Shift+Period",
+    key: "Meta+Shift+.",
     command: { type: "MasterCount", delta: 1 },
   },
 ];
@@ -280,9 +301,9 @@ const RESYNC_INTERVAL_MS = 5000;
  */
 function runInKwin(): void {
   const transport = new DBusTransport();
-  start(transport, "plasma-6");
-
-  const resync = () => pushTopology(transport);
+  // `resync` re-sends Hello until the daemon acks, then pushes topology — so a
+  // daemon that was down at load (or restarts) recovers on the next tick.
+  const resync = start(transport, "plasma-6");
   workspace.windowAdded.connect(resync);
   workspace.windowRemoved.connect(resync);
   workspace.desktopsChanged.connect(resync);

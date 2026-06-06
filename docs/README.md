@@ -30,6 +30,7 @@ compositor events to the daemon and applies the geometry it computes.
 
 - [usage/keybindings.md](usage/keybindings.md) — default shortcuts.
 - [usage/riftctl.md](usage/riftctl.md) — the command-line client.
+- [usage/pager.md](usage/pager.md) — the numbered virtual-desktop pager plasmoid.
 
 ## Operating
 
@@ -45,3 +46,4 @@ compositor events to the daemon and applies the geometry it computes.
 | `crates/riftctl`  | The command-line client.                                      |
 | `crates/rift-ipc` | Shared protocol: framing and `Event`/`Command`/`Reply` types. |
 | `rift-kwin`       | The KWin script (TypeScript), built to a single JS bundle.    |
+| `rift-pager`      | The virtual-desktop pager plasmoid (QML, daemon-independent).  |

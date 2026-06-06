@@ -8,8 +8,9 @@
   "scripts": {
     "build": "esbuild src/main.ts --bundle --format=iife --target=es2017 --outfile=contents/code/main.js",
     "build:harness": "esbuild src/protocol.ts --bundle --format=esm --target=es2020 --outfile=dist/protocol.mjs",
+    "build:harness-main": "esbuild src/main.ts --bundle --format=esm --target=es2020 --outfile=dist/main.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build:harness && node --test test/handshake.test.mjs"
+    "test": "npm run build:harness && npm run build:harness-main && node --test test/handshake.test.mjs test/reconnect.test.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.24.0",

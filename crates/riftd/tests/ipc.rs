@@ -282,6 +282,89 @@ async fn toggle_tiling_round_trips_over_socket() {
     assert!(matches!(reply, Reply::Geometry(set) if set.windows.len() == 2));
 }
 
+/// A two-window topology on one output/desktop/activity, reused by tests that
+/// only care that geometry comes back.
+fn sample_topology() -> Topology {
+    Topology {
+        outputs: vec![Output {
+            id: "o1".into(),
+            name: "o1".into(),
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        }],
+        desktops: vec![Desktop {
+            id: "d1".into(),
+            name: "d1".into(),
+        }],
+        activities: vec![Activity {
+            id: "a1".into(),
+            name: "a1".into(),
+        }],
+        windows: vec![
+            Window {
+                id: "w1".into(),
+                output: "o1".into(),
+                desktop: "d1".into(),
+                activity: "a1".into(),
+            },
+            Window {
+                id: "w2".into(),
+                output: "o1".into(),
+                desktop: "d1".into(),
+                activity: "a1".into(),
+            },
+        ],
+    }
+}
+
+/// Daemon-side of the reconnect contract: a freshly started daemon needs no
+/// prior connection state to tile. After the script's re-handshake (`Hello` →
+/// `Ack`), the first `Topology` push establishes geometry, and a repeated push
+/// (the heartbeat resync) re-establishes the same geometry — so a late or
+/// restarted daemon recovers the instant the script's heartbeat reaches it.
+#[tokio::test]
+async fn handshake_then_topology_recovers_geometry() {
+    let (socket, _dir, _stop) = spawn_server().await;
+    let mut stream = UnixStream::connect(&socket).await.unwrap();
+
+    // The script re-handshakes against the fresh daemon.
+    let hello = Event::Hello {
+        kwin_version: "6.2.0".into(),
+        protocol: PROTOCOL_VERSION,
+    };
+    write_frame(&mut stream, &hello).await.unwrap();
+    let reply: Reply = read_frame(&mut stream).await.unwrap();
+    assert_eq!(reply, Reply::Ack);
+
+    // First topology push tiles from a clean slate.
+    write_frame(&mut stream, &Event::Topology(sample_topology()))
+        .await
+        .unwrap();
+    let reply: Reply = read_frame(&mut stream).await.unwrap();
+    match reply {
+        Reply::Geometry(set) => assert_eq!(set.windows.len(), 2),
+        other => panic!("expected Geometry, got {other:?}"),
+    }
+
+    // The heartbeat re-pushes the same topology; geometry re-establishes, not
+    // duplicates or drops.
+    write_frame(&mut stream, &Event::Topology(sample_topology()))
+        .await
+        .unwrap();
+    let reply: Reply = read_frame(&mut stream).await.unwrap();
+    match reply {
+        Reply::Geometry(set) => {
+            let ids: Vec<String> = set.windows.iter().map(|g| g.id.to_string()).collect();
+            assert_eq!(ids, vec!["w1".to_string(), "w2".to_string()]);
+        }
+        other => panic!("expected Geometry, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn unknown_message_errors() {
     let (socket, _dir, _stop) = spawn_server().await;

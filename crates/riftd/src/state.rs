@@ -16,7 +16,15 @@ use rift_ipc::{
 use crate::config::{BehaviorConfig, Config};
 use crate::layout::{self, LayoutParams};
 
+/// Sentinel id used to collapse a cell dimension (desktop or activity) when its
+/// `per_*` flag is off, so every value along that dimension shares one cell. The
+/// leading NUL keeps it from colliding with any real compositor id.
+const COLLAPSED: &str = "\0rift-all";
+
 /// Identifies a cell by its `(output, desktop, activity)` tuple.
+///
+/// When `per_desktop`/`per_activity` is off the corresponding field holds
+/// [`COLLAPSED`] instead of the live id, merging that dimension into one cell.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CellKey {
     pub output: OutputId,
@@ -43,8 +51,9 @@ pub struct State {
     /// The active window as last reported by the script, validated against the
     /// live topology on every reconcile so it can never point at a dead window.
     focused: Option<WindowId>,
-    /// Session behavior flags from config. Stored and surfaced; their runtime
-    /// effects are deferred (see the milestone notes).
+    /// Session behavior flags from config. `per_desktop`/`per_activity` gate how
+    /// [`State::reconcile`] keys cells (collapsing a dimension when off);
+    /// `focus_follows_mouse` is surfaced but not yet acted on.
     behavior: BehaviorConfig,
     /// Whether global auto-tiling is enabled. When false, [`State::geometry`]
     /// emits nothing so every window floats where KWin last left it.
@@ -110,6 +119,11 @@ impl State {
             topology.activities.iter().map(|a| &a.id).collect();
 
         // (1) Map present tuples -> ordered windows, skipping orphan references.
+        //
+        // Orphan detection always checks the *raw* topology ids so a window on a
+        // vanished desktop/activity is still dropped; only the cell *key* is
+        // collapsed when a `per_*` flag is off, merging that dimension's windows
+        // into a single shared cell.
         let mut present: HashMap<CellKey, Vec<WindowId>> = HashMap::new();
         for w in &topology.windows {
             if !outputs.contains(&w.output)
@@ -120,8 +134,16 @@ impl State {
             }
             let key = CellKey {
                 output: w.output.clone(),
-                desktop: w.desktop.clone(),
-                activity: w.activity.clone(),
+                desktop: if self.behavior.per_desktop {
+                    w.desktop.clone()
+                } else {
+                    DesktopId::from(COLLAPSED)
+                },
+                activity: if self.behavior.per_activity {
+                    w.activity.clone()
+                } else {
+                    rift_ipc::ActivityId::from(COLLAPSED)
+                },
             };
             present.entry(key).or_default().push(w.id.clone());
         }
@@ -331,7 +353,7 @@ impl State {
     ///
     /// `default` only affects *newly materialized* cells; ratio and gaps take
     /// effect at the next [`State::geometry`] (i.e. the next reconcile/relayout).
-    /// Behavior flags are stored but their runtime effects are deferred.
+    /// `per_desktop`/`per_activity` re-key cells on the next reconcile.
     pub fn apply_config(&mut self, cfg: &Config) {
         self.default_layout = cfg.layout.default;
         self.params.master_ratio = cfg.layout.master_ratio;
@@ -664,7 +686,8 @@ mod tests {
         assert!(!state.behavior.per_desktop);
         assert!(state.behavior.focus_follows_mouse);
 
-        // A newly materialized cell adopts the new default layout.
+        // A newly materialized cell adopts the new default layout. Both opt-in
+        // flags are off in this config, so the cell is keyed on the output alone.
         state.reconcile(&Topology {
             outputs: vec![output("o1")],
             desktops: vec![desktop("d1")],
@@ -672,7 +695,7 @@ mod tests {
             windows: vec![window("w1", "o1", "d1", "a1")],
         });
         assert_eq!(
-            state.cells()[&key("o1", "d1", "a1")].layout,
+            state.cells()[&collapsed_key("o1")].layout,
             LayoutKind::Monocle
         );
 
@@ -792,6 +815,110 @@ mod tests {
             behavior: BehaviorConfig::default(),
         });
         assert!(state.geometry().windows.is_empty());
+    }
+
+    /// Build a state with the given opt-in flags applied via config.
+    fn state_with_behavior(per_desktop: bool, per_activity: bool) -> State {
+        use crate::config::{BehaviorConfig, Config, GapsConfig, LayoutConfig};
+
+        let mut state = State::default();
+        state.apply_config(&Config {
+            layout: LayoutConfig {
+                default: LayoutKind::Tile,
+                master_ratio: 0.6,
+                master_count: 1,
+                tiling_enabled: true,
+            },
+            gaps: GapsConfig::default(),
+            behavior: BehaviorConfig {
+                per_desktop,
+                per_activity,
+                focus_follows_mouse: false,
+            },
+        });
+        state
+    }
+
+    /// The cell key for an output whose desktop+activity dimensions are collapsed.
+    fn collapsed_key(output: &str) -> CellKey {
+        CellKey {
+            output: output.into(),
+            desktop: COLLAPSED.into(),
+            activity: COLLAPSED.into(),
+        }
+    }
+
+    /// `per_activity = false` merges windows across activities into one cell.
+    #[test]
+    fn per_activity_off_merges_activities_into_one_cell() {
+        let mut state = state_with_behavior(true, false);
+        state.reconcile(&Topology {
+            outputs: vec![output("o1")],
+            desktops: vec![desktop("d1")],
+            activities: vec![activity("a1"), activity("a2")],
+            windows: vec![
+                window("w1", "o1", "d1", "a1"),
+                window("w2", "o1", "d1", "a2"),
+            ],
+        });
+        assert_eq!(state.cell_count(), 1, "activities collapse into one cell");
+        assert_eq!(state.window_count(), 2);
+    }
+
+    /// `per_desktop = false` merges windows across desktops into one cell.
+    #[test]
+    fn per_desktop_off_merges_desktops_into_one_cell() {
+        let mut state = state_with_behavior(false, true);
+        state.reconcile(&Topology {
+            outputs: vec![output("o1")],
+            desktops: vec![desktop("d1"), desktop("d2")],
+            activities: vec![activity("a1")],
+            windows: vec![
+                window("w1", "o1", "d1", "a1"),
+                window("w2", "o1", "d2", "a1"),
+            ],
+        });
+        assert_eq!(state.cell_count(), 1, "desktops collapse into one cell");
+        assert_eq!(state.window_count(), 2);
+    }
+
+    /// With both flags off, only the output keys a cell; outputs never collapse.
+    #[test]
+    fn both_flags_off_keys_cells_by_output_only() {
+        let mut state = state_with_behavior(false, false);
+        state.reconcile(&Topology {
+            outputs: vec![output("o1"), output("o2")],
+            desktops: vec![desktop("d1"), desktop("d2")],
+            activities: vec![activity("a1"), activity("a2")],
+            windows: vec![
+                window("w1", "o1", "d1", "a1"),
+                window("w2", "o1", "d2", "a2"),
+                window("w3", "o2", "d1", "a1"),
+            ],
+        });
+        // o1's two windows (different desktop *and* activity) share one cell; o2
+        // keeps its own. Output is never collapsed.
+        assert_eq!(state.cell_count(), 2);
+        assert_eq!(state.cells()[&collapsed_key("o1")].windows.len(), 2);
+        assert_eq!(state.cells()[&collapsed_key("o2")].windows.len(), 1);
+    }
+
+    /// Collapsing a dimension must not weaken orphan pruning: a window on a
+    /// vanished desktop is still dropped even when `per_desktop` is off.
+    #[test]
+    fn collapsed_desktop_still_drops_orphan_window() {
+        let mut state = state_with_behavior(false, true);
+        state.reconcile(&Topology {
+            outputs: vec![output("o1")],
+            desktops: vec![desktop("d1")],
+            activities: vec![activity("a1")],
+            windows: vec![
+                window("w1", "o1", "d1", "a1"),
+                // d2 is not a live desktop -> orphan, dropped despite collapse.
+                window("w2", "o1", "d2", "a1"),
+            ],
+        });
+        assert_eq!(state.window_count(), 1);
     }
 
     /// Focus cannot survive its window being removed from the topology.

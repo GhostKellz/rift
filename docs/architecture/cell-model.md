@@ -15,6 +15,13 @@ Cells are **derived from topology, never persisted**. The set of live cells is
 whatever the most recent topology implies; a cell exists only while its output,
 desktop, and activity all exist.
 
+The `desktop` and `activity` parts of the key are **opt-in**. When
+`behavior.per_desktop` or `behavior.per_activity` is off, that dimension collapses
+to a single shared value, so windows across every desktop (or activity) on an
+output land in one cell. Orphan detection still runs against the *raw* topology
+ids, so a window on a vanished desktop is dropped even when the dimension is
+collapsed. The output is never collapsed.
+
 ## Reconcile
 
 `reconcile(topology)` brings the cell model in line with a fresh snapshot:
@@ -32,6 +39,25 @@ desktop, and activity all exist.
 
 `reset()` rebuilds the entire model from the retained last topology, forcing full
 re-materialization. This is the recovery path exposed by `riftctl reset`.
+
+## Lifetime of per-window state
+
+Windows are identified by KWin's `internalId` — a QUuid that is stable **within a
+session but minted fresh when KWin restarts**. Rift treats this as the only window
+identity and does not persist or heuristically re-match windows across a compositor
+restart. The consequences:
+
+- **Per-cell state** (layout kind, master ratio/count) is keyed by cell, not by
+  window, so it survives any reconcile — including the full rebuild after a
+  monitor hotplug or desktop change.
+- **Per-window marks** (focus, floating) are **session-scoped**. They are pruned
+  the moment their window leaves the topology and are rebuilt from the next
+  topology push. After a KWin restart every window is a new id, so these marks
+  start clean.
+
+This is a deliberate trade: keeping the cell model the single source of truth
+avoids brittle cross-restart identity heuristics, at the cost of forgetting
+floating marks when the compositor itself restarts.
 
 ## Why this shape
 

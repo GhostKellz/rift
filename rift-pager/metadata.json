@@ -1,0 +1,15 @@
+{
+  "KPlugin": {
+    "Id": "dev.ghostkellz.riftpager",
+    "Name": "Rift Pager",
+    "Description": "Numbered virtual-desktop pager: click a box to switch desktops",
+    "Icon": "preferences-desktop-virtual",
+    "Version": "0.1.0",
+    "License": "MIT",
+    "Authors": [{ "Name": "Rift" }],
+    "Category": "Windows and Tasks",
+    "EnabledByDefault": true
+  },
+  "KPackageStructure": "Plasma/Applet",
+  "X-Plasma-API-Minimum-Version": "6.0"
+}

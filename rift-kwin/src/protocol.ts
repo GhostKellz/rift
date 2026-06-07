@@ -44,6 +44,10 @@ export interface Window {
   output: string;
   desktop: string;
   activity: string;
+  /** Resource class, forwarded so the daemon can match window rules. */
+  class: string | null;
+  /** Window title, forwarded so the daemon can match window rules. */
+  title: string | null;
 }
 
 /** Full snapshot of the live KWin topology, mirroring `rift_ipc::Topology`. */
@@ -81,13 +85,27 @@ export type Command =
   | { type: "Reset" }
   | { type: "Focus"; direction: Direction }
   | { type: "Move"; direction: Direction }
+  | { type: "Resize"; direction: Direction }
   | { type: "SetLayout"; layout: LayoutKind }
   | { type: "MasterRatio"; delta: number }
   | { type: "MasterCount"; delta: number }
   | { type: "ToggleTiling" }
   | { type: "ToggleFloat"; window: string | null }
   | { type: "GetConfig" }
+  | { type: "GetKeybindings" }
   | { type: "Reload" };
+
+/**
+ * One entry in the daemon-owned keybinding table, mirroring
+ * `rift_ipc::Keybinding`. The script registers each via `registerShortcut`,
+ * forwarding `command` to the daemon when the shortcut fires.
+ */
+export interface Keybinding {
+  id: string;
+  description: string;
+  key: string;
+  command: Command;
+}
 
 /** Result of a reconcile pass. */
 export interface ReconcileReport {
@@ -127,8 +145,10 @@ export type Reply =
   | { type: "Status"; version: string; protocol: number; uptime_secs: number; cells: number; windows: number }
   | { type: "Reconciled"; cells: number; windows: number }
   | { type: "Geometry"; windows: WindowGeometry[] }
+  | { type: "GeometryResync"; windows: WindowGeometry[] }
   | { type: "Focus"; window: string | null }
   | ({ type: "Config" } & ConfigReport)
+  | { type: "Keybindings"; bindings: Keybinding[] }
   | { type: "Error"; message: string };
 
 /** Wrap a topology snapshot in its event envelope for the wire. */

@@ -1,5 +1,7 @@
 //! Rift CLI: a thin client over the daemon's IPC socket.
 
+mod setup;
+
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -37,6 +39,11 @@ enum Cmd {
         #[arg(value_enum)]
         direction: Dir,
     },
+    /// Resize the focused tiled split (Left/Right adjust the master area).
+    Resize {
+        #[arg(value_enum)]
+        direction: Dir,
+    },
     /// Switch the focused cell to a layout.
     Layout {
         #[arg(value_enum)]
@@ -55,8 +62,17 @@ enum Cmd {
     },
     /// Print the daemon's effective configuration.
     Config,
+    /// Print the daemon's effective keybinding table (defaults plus `[keys]`).
+    Keys,
     /// Re-read the config from disk and apply it.
     Reload,
+    /// Per-user KDE integration: enable the KWin script, free Meta+L, clear stale
+    /// shortcut records, and start the daemon. Idempotent; safe to re-run.
+    Setup {
+        /// Skip enabling/starting the systemd --user unit.
+        #[arg(long)]
+        no_service: bool,
+    },
 }
 
 /// CLI-facing direction, mapped to [`Direction`] on the wire.
@@ -121,6 +137,15 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Cmd::Resize { direction } => {
+            relayout(
+                &socket,
+                IpcCommand::Resize {
+                    direction: direction.into(),
+                },
+            )
+            .await
+        }
         Cmd::Layout { kind } => {
             relayout(
                 &socket,
@@ -143,7 +168,9 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Cmd::Config => config(&socket, IpcCommand::GetConfig).await,
+        Cmd::Keys => keys(&socket).await,
         Cmd::Reload => config(&socket, IpcCommand::Reload).await,
+        Cmd::Setup { no_service } => setup::run(&socket, no_service).await,
     }
 }
 
@@ -225,6 +252,24 @@ async fn config(socket: &std::path::Path, cmd: IpcCommand) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Print the daemon-owned keybinding table (defaults overlaid by `[keys]`).
+async fn keys(socket: &std::path::Path) -> anyhow::Result<()> {
+    let reply = request(socket, &IpcCommand::GetKeybindings)
+        .await
+        .with_context(|| format!("querying keybindings at {}", socket.display()))?;
+
+    match reply {
+        Reply::Keybindings { bindings } => {
+            for b in bindings {
+                println!("{:<24} {:<18} {}", b.id, b.key, b.description);
+            }
+        }
+        Reply::Error { message } => anyhow::bail!("daemon error: {message}"),
+        other => anyhow::bail!("unexpected reply to GetKeybindings: {other:?}"),
+    }
+    Ok(())
+}
+
 /// Send a command that triggers a relayout and report the resulting window count.
 async fn relayout(socket: &std::path::Path, cmd: IpcCommand) -> anyhow::Result<()> {
     let reply = request(socket, &cmd)
@@ -232,7 +277,11 @@ async fn relayout(socket: &std::path::Path, cmd: IpcCommand) -> anyhow::Result<(
         .with_context(|| format!("sending {cmd:?} to {}", socket.display()))?;
 
     match reply {
-        Reply::Geometry(set) => println!("relaid out {} windows", set.windows.len()),
+        // A cross-output `Move` answers with `GeometryResync`; the CLI has no
+        // topology to re-push, but the window count is still the useful signal.
+        Reply::Geometry(set) | Reply::GeometryResync(set) => {
+            println!("relaid out {} windows", set.windows.len())
+        }
         Reply::Error { message } => anyhow::bail!("daemon error: {message}"),
         other => anyhow::bail!("unexpected reply to {cmd:?}: {other:?}"),
     }

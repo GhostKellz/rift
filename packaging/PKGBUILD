@@ -1,0 +1,72 @@
+# Maintainer: Christopher Kelley <ckelley@ghostkellz.sh>
+pkgname=rift
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Tiling window manager daemon for KDE Plasma 6 / KWin"
+arch=('x86_64')
+url="https://github.com/ghostkellz/rift"
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo' 'npm')
+optdepends=('kwin: in-KWin tiling (the rift-kwin script)'
+            'plasma-workspace: riftctl setup (kwriteconfig6/qdbus6/gdbus surgery)'
+            'plasma-desktop: add the Rift Pager widget to a panel')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+install="$pkgname.install"
+
+prepare() {
+    cd "$pkgname-$pkgver"
+    # Vendor crates so build() can run offline (--frozen).
+    export CARGO_HOME="$srcdir/cargo-home"
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$pkgname-$pkgver"
+    export CARGO_HOME="$srcdir/cargo-home"
+    # Use the distro toolchain rather than the repo's pinned rustup channel.
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+
+    cargo build --frozen --release --all
+
+    # Bundle the KWin script (TypeScript -> es2017 JS at contents/code/main.js).
+    npm --prefix rift-kwin ci
+    npm --prefix rift-kwin run build
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    export CARGO_HOME="$srcdir/cargo-home"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo test --frozen --release --all
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+
+    # Daemon and CLI.
+    install -Dm755 "target/release/riftd" "$pkgdir/usr/bin/riftd"
+    install -Dm755 "target/release/riftctl" "$pkgdir/usr/bin/riftctl"
+
+    # systemd --user unit (started per-user by `riftctl setup`).
+    install -Dm644 "packaging/riftd.service" \
+        "$pkgdir/usr/lib/systemd/user/riftd.service"
+
+    # KWin script KPackage. KWin discovers scripts under /usr/share/kwin/scripts.
+    install -Dm644 "rift-kwin/metadata.json" \
+        "$pkgdir/usr/share/kwin/scripts/rift/metadata.json"
+    install -Dm644 "rift-kwin/contents/code/main.js" \
+        "$pkgdir/usr/share/kwin/scripts/rift/contents/code/main.js"
+
+    # Plasma pager applet.
+    local pager="usr/share/plasma/plasmoids/dev.ghostkellz.riftpager"
+    install -Dm644 "rift-pager/metadata.json" "$pkgdir/$pager/metadata.json"
+    cp -r "rift-pager/contents" "$pkgdir/$pager/contents"
+
+    # License and docs.
+    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

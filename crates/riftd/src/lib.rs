@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod dbus;
+pub mod keys;
 pub mod layout;
 pub mod server;
 pub mod state;

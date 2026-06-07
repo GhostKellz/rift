@@ -1,9 +1,12 @@
 #!/bin/sh
-# Build, install, and enable the rift-kwin script for the current user.
+# Dev install: build the rift-kwin script from source, install it for the current
+# user, then hand the KDE integration (enable, free Meta+L, clear stale shortcut
+# records) to `riftctl setup`.
 #
-# Assembles a KWin KPackage at:
-#   $XDG_DATA_HOME/kwin/scripts/rift/   (default ~/.local/share/...)
-# then enables it via kwriteconfig6 and asks KWin to reconfigure.
+# This is the from-source path. The packaged install drops the script under
+# /usr/share and you run `riftctl setup` directly; here we build and stage it in
+# the user data dir first, then call the freshly built riftctl with --no-service
+# (a dev checkout has no system riftd.service — start `riftd` from target/).
 
 set -eu
 
@@ -21,104 +24,26 @@ if [ ! -f "$kwin_src/contents/code/main.js" ]; then
     exit 1
 fi
 
-echo "==> Installing to $install_dir"
+echo "==> Installing the script to $install_dir"
 rm -rf "$install_dir"
 mkdir -p "$install_dir/contents/code"
 cp "$kwin_src/metadata.json" "$install_dir/metadata.json"
 cp "$kwin_src/contents/code/main.js" "$install_dir/contents/code/main.js"
 
-echo "==> Clearing stale rift shortcut records (KGlobalAccel D-Bus)"
-# KGlobalAccel keeps an action's STORED active key over a script's requested
-# default — even when the stored value is empty, which it reads as "the user
-# cleared this." rift ids whose default changed (the Meta+Shift+T/D remaps) or
-# that ever landed empty are then stuck and never pick up the script's new
-# default. Removing each action's KGlobalAccel record makes the script's next
-# registerShortcut be treated as brand-new, so the current default applies.
-# rift registers under the "kwin" component (KWin scripting shortcuts).
-if command -v qdbus6 >/dev/null 2>&1; then
-    rift_actions="\
-rift_focus_left rift_focus_down rift_focus_up rift_focus_right \
-rift_move_left rift_move_down rift_move_up rift_move_right \
-rift_layout_tile rift_layout_monocle rift_layout_columns rift_layout_spiral \
-rift_layout_threecolumn rift_layout_floating \
-rift_toggle_tiling rift_toggle_float \
-rift_master_ratio_dec rift_master_ratio_inc \
-rift_master_count_dec rift_master_count_inc"
-    for action in $rift_actions; do
-        qdbus6 org.kde.kglobalaccel /kglobalaccel \
-            org.kde.KGlobalAccel.unregister kwin "$action" >/dev/null 2>&1 || true
-    done
-    echo "    cleared KGlobalAccel records for rift_* under the kwin component"
-    echo "    (the script re-registers them with current defaults on next load)"
-else
-    echo "warning: qdbus6 not found; stale rift binds may keep empty shortcuts" >&2
+echo "==> Building riftctl"
+cargo build --release --manifest-path "$repo_root/Cargo.toml" -p riftctl
+
+riftctl="$repo_root/target/release/riftctl"
+if [ ! -x "$riftctl" ]; then
+    riftctl=riftctl  # fall back to PATH
 fi
 
-echo "==> Freeing Meta+L for rift (moving KDE Lock Session to Ctrl+Alt+L)"
-# rift binds Meta+L to focus-right, which collides with KDE's "Lock Session"
-# global. KGlobalAccel silently drops the loser, so reassign Lock first.
-#
-# Target is Ctrl+Alt+L (the conventional Linux lock chord, verified free): the
-# planned Meta+Escape is taken by KDE System Monitor, and Meta+Shift+Escape too.
-#
-# A direct kglobalshortcutsrc edit does NOT take — the running kglobalaccel owns
-# the file in memory and reverts it (tasks/lessons.md L4/L5). The reliable path
-# is the live D-Bus setter, which needs the QKeySequence as FOUR ints
-# [key,0,0,0]; a single int crashes kglobalaccel. qdbus6 can't marshal a(ai),
-# so use gdbus. Ctrl+Alt+L = 0x04000000|0x08000000|0x4C = 201326668.
-lock_action='["ksmserver", "Lock Session", "Session Management", "Lock Session"]'
-lock_key=201326668
-if command -v gdbus >/dev/null 2>&1; then
-    # Back up the user's shortcut config once before touching it.
-    ksrc="${XDG_CONFIG_HOME:-$HOME/.config}/kglobalshortcutsrc"
-    if [ -f "$ksrc" ] && [ ! -f "$ksrc.rift.bak" ]; then
-        cp "$ksrc" "$ksrc.rift.bak"
-        echo "    backed up $ksrc -> $ksrc.rift.bak"
-    fi
-    avail=$(gdbus call --session --dest org.kde.kglobalaccel \
-        --object-path /kglobalaccel \
-        --method org.kde.KGlobalAccel.globalShortcutAvailable \
-        "([$lock_key, 0, 0, 0],)" "kwin" 2>/dev/null || true)
-    case "$avail" in
-        *true*)
-            gdbus call --session --dest org.kde.kglobalaccel \
-                --object-path /kglobalaccel \
-                --method org.kde.KGlobalAccel.setForeignShortcutKeys \
-                "$lock_action" "[([$lock_key, 0, 0, 0],)]" >/dev/null 2>&1 || true
-            readback=$(gdbus call --session --dest org.kde.kglobalaccel \
-                --object-path /kglobalaccel \
-                --method org.kde.KGlobalAccel.shortcutKeys \
-                "$lock_action" 2>/dev/null || true)
-            case "$readback" in
-                *$lock_key*) echo "    Lock Session rebound to Ctrl+Alt+L (live)";;
-                *) echo "warning: Lock Session set did not read back; check System Settings" >&2;;
-            esac
-            ;;
-        *)
-            echo "    note: Ctrl+Alt+L not free; leaving Lock Session unchanged"
-            echo "          (Meta+L may still collide with rift focus-right)"
-            ;;
-    esac
-else
-    echo "warning: gdbus not found; can't move Lock Session off Meta+L" >&2
-    echo "         set Lock Session to Ctrl+Alt+L manually in System Settings" >&2
-fi
+echo "==> Running riftctl setup (KDE integration)"
+# --no-service: a dev checkout has no /usr/lib/systemd/user/riftd.service.
+# The shortcut-clear step needs a running daemon to enumerate ids, so start
+# `riftd` first if you want it to take; otherwise re-run this once it is up.
+"$riftctl" setup --no-service || true
 
-echo "==> Enabling KWin script"
-if command -v kwriteconfig6 >/dev/null 2>&1; then
-    kwriteconfig6 --file kwinrc --group Plugins --key rift-kwinEnabled true
-else
-    echo "warning: kwriteconfig6 not found; enable 'rift-kwin' manually" >&2
-fi
-
-if command -v qdbus6 >/dev/null 2>&1; then
-    qdbus6 org.kde.KWin /KWin reconfigure || true
-else
-    echo "warning: qdbus6 not found; reconfigure KWin manually" >&2
-fi
-
-echo "==> Done. Start the daemon with: riftd"
-echo "    rift's own shortcuts re-register with current defaults when the script"
-echo "    loads (cleared above via KGlobalAccel D-Bus)."
-echo "    KDE Lock Session was moved to Ctrl+Alt+L (live, via KGlobalAccel D-Bus)"
-echo "    so rift can own Meta+L for focus-right."
+echo "==> Done. Start the daemon with: $repo_root/target/release/riftd"
+echo "    (or: cargo run -p riftd). If shortcuts look stale, re-run with riftd"
+echo "    running: $riftctl setup --no-service"

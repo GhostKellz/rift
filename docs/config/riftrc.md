@@ -14,8 +14,9 @@ The daemon never creates this file or its parent directory.
 
 ## Format
 
-Three optional sections. Omitted sections fall back to defaults; unknown keys are
-rejected so typos surface instead of being silently ignored.
+Three optional sections plus an optional `[keys]` table and `[[rules]]` array.
+Omitted sections fall back to defaults; unknown keys are rejected so typos surface
+instead of being silently ignored.
 
 ```toml
 [layout]
@@ -31,7 +32,23 @@ outer = 12
 per_desktop = true
 per_activity = false
 focus_follows_mouse = false
+
+[keys]
+rift_layout_monocle = "Meta+Shift+M"
+
+[[rules]]
+class = "org.kde.polkit-kde-authentication-agent-1"
+float = true
 ```
+
+The `[keys]` table is optional. Each entry maps a built-in binding id to a
+replacement key sequence; the daemon applies it before handing the table to the
+script. Unknown ids and empty sequences are rejected. See
+[reference.md](reference.md) for the binding ids and the full rule shape.
+
+The `[[rules]]` array is optional and may repeat. Each entry floats windows whose
+class or title matches (case-sensitive substring); see
+[reference.md](reference.md) for the full rule shape.
 
 See [reference.md](reference.md) for every key, its default, and its valid range.
 

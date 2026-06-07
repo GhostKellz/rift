@@ -1,0 +1,17 @@
+[Unit]
+Description=Rift tiling window manager daemon
+Documentation=https://github.com/ghostkellz/rift
+# Bound to the graphical session: it manages a live KWin session and stops with
+# it. The daemon tolerates KWin/session-bus coming up after it (it retries the
+# handshake), so no hard ordering on the compositor is required.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/riftd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

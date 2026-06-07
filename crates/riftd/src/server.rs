@@ -17,7 +17,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::state::State;
+use crate::state::{MoveOutcome, State};
 
 /// Shared daemon state behind the IPC server.
 pub(crate) struct Daemon {
@@ -80,7 +80,17 @@ impl Daemon {
                     window: self.state.focus_neighbor(direction),
                 },
                 Command::Move { direction } => {
-                    self.state.move_window(direction);
+                    // A cross-output move needs the script to re-push topology so
+                    // the daemon re-keys the window on its new output.
+                    match self.state.move_window(direction) {
+                        MoveOutcome::CrossedOutput => Reply::GeometryResync(self.state.geometry()),
+                        MoveOutcome::Swapped | MoveOutcome::None => {
+                            Reply::Geometry(self.state.geometry())
+                        }
+                    }
+                }
+                Command::Resize { direction } => {
+                    self.state.resize(direction);
                     Reply::Geometry(self.state.geometry())
                 }
                 Command::SetLayout { layout } => {
@@ -104,6 +114,9 @@ impl Daemon {
                     Reply::Geometry(self.state.geometry())
                 }
                 Command::GetConfig => Reply::Config(self.config_report()),
+                Command::GetKeybindings => Reply::Keybindings {
+                    bindings: self.state.keybindings(),
+                },
                 Command::Reload => match self.reload() {
                     Ok(()) => {
                         info!(path = %self.config_path.display(), "config reloaded");
@@ -437,6 +450,50 @@ mod tests {
                 assert_eq!(set.windows[0].id, "w2".into());
             }
             other => panic!("expected Geometry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_output_move_replies_with_resync() {
+        let mut d = daemon();
+        let topo = json!({
+            "type": "Topology",
+            "outputs": [
+                { "id": "o1", "name": "o1",
+                  "rect": { "x": 0, "y": 0, "width": 1920, "height": 1080 } },
+                { "id": "o2", "name": "o2",
+                  "rect": { "x": 1920, "y": 0, "width": 1920, "height": 1080 } }
+            ],
+            "desktops": [{ "id": "d1", "name": "d1" }],
+            "activities": [{ "id": "a1", "name": "a1" }],
+            "windows": [{ "id": "w1", "output": "o1", "desktop": "d1", "activity": "a1" }]
+        });
+        d.dispatch(topo);
+        d.dispatch(json!({ "type": "Focus", "window": "w1" }));
+
+        // w1 is alone on o1, so moving right relocates it onto o2 and the daemon
+        // asks the script to resync topology.
+        match d.dispatch(json!({ "type": "Move", "direction": "Right" })) {
+            Reply::GeometryResync(set) => {
+                let wg = set
+                    .windows
+                    .iter()
+                    .find(|g| g.id == "w1".into())
+                    .expect("moved window has geometry");
+                assert!(wg.rect.x >= 1920, "placed on the right output");
+            }
+            other => panic!("expected GeometryResync, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_keybindings_returns_table() {
+        match daemon().dispatch(json!({ "type": "GetKeybindings" })) {
+            Reply::Keybindings { bindings } => {
+                assert!(!bindings.is_empty());
+                assert!(bindings.iter().any(|b| b.id == "rift_focus_left"));
+            }
+            other => panic!("expected Keybindings, got {other:?}"),
         }
     }
 

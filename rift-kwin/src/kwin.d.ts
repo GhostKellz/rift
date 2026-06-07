@@ -73,6 +73,10 @@ interface KWinVirtualDesktop {
 interface KWinWindow {
   /** Stable per-window identity (QUuid as string). */
   readonly internalId: string;
+  /** Resource class (the X11/Wayland app id), used for window-rule matching. */
+  readonly resourceClass: string;
+  /** Window caption (title), used for window-rule matching. */
+  readonly caption: string;
   readonly output: KWinOutput;
   /** Desktops the window is on; empty means "all desktops". */
   readonly desktops: KWinVirtualDesktop[];

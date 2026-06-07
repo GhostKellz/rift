@@ -6,12 +6,15 @@
 //! that is present but malformed or out of range is rejected wholesale with a
 //! diagnostic; the daemon never applies a partial configuration.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{Context, bail};
 use rift_ipc::LayoutKind;
 use serde::Deserialize;
+
+use crate::keys;
 
 /// The effective configuration, mirroring the `riftrc` sections.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -20,6 +23,48 @@ pub struct Config {
     pub layout: LayoutConfig,
     pub gaps: GapsConfig,
     pub behavior: BehaviorConfig,
+    /// `[[rules]]`: per-window overrides matched on class/title.
+    pub rules: Vec<WindowRule>,
+    /// `[keys]`: per-binding key overrides, keyed by the stable binding id
+    /// (e.g. `rift_focus_left = "Meta+Left"`). Unknown ids are rejected.
+    pub keys: HashMap<String, String>,
+}
+
+/// A `[[rules]]` entry: match a window by `class` and/or `title` and apply an
+/// override. A rule with neither field set matches nothing (and is rejected by
+/// [`Config::validate`]); when both are set, both must match.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowRule {
+    /// Substring matched (case-sensitively) against the window's resource class.
+    #[serde(default)]
+    pub class: Option<String>,
+    /// Substring matched (case-sensitively) against the window's title.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Force the matched window to float (skip tiling).
+    #[serde(default)]
+    pub float: bool,
+}
+
+impl WindowRule {
+    /// Whether this rule matches a window's `class`/`title`. Each present field
+    /// is a case-sensitive substring test; an absent field is a wildcard. A rule
+    /// with no fields never matches (guarded against in [`Config::validate`]).
+    pub fn matches(&self, class: Option<&str>, title: Option<&str>) -> bool {
+        if self.class.is_none() && self.title.is_none() {
+            return false;
+        }
+        let class_ok = match &self.class {
+            Some(want) => class.is_some_and(|c| c.contains(want.as_str())),
+            None => true,
+        };
+        let title_ok = match &self.title {
+            Some(want) => title.is_some_and(|t| t.contains(want.as_str())),
+            None => true,
+        };
+        class_ok && title_ok
+    }
 }
 
 /// `[layout]`: the default layout and its master-region tunables.
@@ -131,6 +176,19 @@ impl Config {
         if self.gaps.outer < 0 {
             bail!("gaps.outer must not be negative (got {})", self.gaps.outer);
         }
+        for (i, rule) in self.rules.iter().enumerate() {
+            if rule.class.is_none() && rule.title.is_none() {
+                bail!("rules[{i}] must set at least one of `class` or `title`");
+            }
+        }
+        for (id, key) in &self.keys {
+            if !keys::is_known_id(id) {
+                bail!("keys.{id} is not a known binding id");
+            }
+            if key.trim().is_empty() {
+                bail!("keys.{id} must not be empty");
+            }
+        }
         Ok(())
     }
 }
@@ -233,5 +291,83 @@ mod tests {
     fn zero_master_count_is_rejected() {
         let f = write_tmp("[layout]\nmaster_count = 0\n");
         assert!(Config::load(f.path()).is_err());
+    }
+
+    #[test]
+    fn window_rules_parse() {
+        let f = write_tmp(
+            r#"
+            [[rules]]
+            class = "pavucontrol"
+            float = true
+            [[rules]]
+            title = "Picture-in-Picture"
+            float = true
+            "#,
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(cfg.rules.len(), 2);
+        assert_eq!(cfg.rules[0].class.as_deref(), Some("pavucontrol"));
+        assert!(cfg.rules[0].float);
+        assert_eq!(cfg.rules[1].title.as_deref(), Some("Picture-in-Picture"));
+    }
+
+    #[test]
+    fn rule_without_match_field_is_rejected() {
+        let f = write_tmp("[[rules]]\nfloat = true\n");
+        assert!(Config::load(f.path()).is_err());
+    }
+
+    #[test]
+    fn key_overrides_parse() {
+        let f = write_tmp(
+            r#"
+            [keys]
+            rift_focus_left = "Meta+Left"
+            rift_layout_tile = "Meta+T"
+            "#,
+        );
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(
+            cfg.keys.get("rift_focus_left").map(String::as_str),
+            Some("Meta+Left")
+        );
+        assert_eq!(
+            cfg.keys.get("rift_layout_tile").map(String::as_str),
+            Some("Meta+T")
+        );
+    }
+
+    #[test]
+    fn unknown_key_id_is_rejected() {
+        let f = write_tmp("[keys]\nrift_focus_sideways = \"Meta+X\"\n");
+        assert!(Config::load(f.path()).is_err());
+    }
+
+    #[test]
+    fn empty_key_override_is_rejected() {
+        let f = write_tmp("[keys]\nrift_focus_left = \"\"\n");
+        assert!(Config::load(f.path()).is_err());
+    }
+
+    #[test]
+    fn rule_matches_on_class_and_title() {
+        let class_only = WindowRule {
+            class: Some("kitty".into()),
+            title: None,
+            float: true,
+        };
+        assert!(class_only.matches(Some("kitty"), None));
+        assert!(class_only.matches(Some("org.kitty"), Some("anything")));
+        assert!(!class_only.matches(Some("konsole"), None));
+        assert!(!class_only.matches(None, None));
+
+        let both = WindowRule {
+            class: Some("firefox".into()),
+            title: Some("Picture-in-Picture".into()),
+            float: true,
+        };
+        assert!(both.matches(Some("firefox"), Some("Picture-in-Picture")));
+        assert!(!both.matches(Some("firefox"), Some("Mozilla Firefox")));
     }
 }

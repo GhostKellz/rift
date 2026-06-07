@@ -108,12 +108,20 @@ pub struct Activity {
 /// A window is modeled as living on exactly one (output, desktop, activity)
 /// tuple. Windows pinned to "all desktops"/"all activities" are resolved to a
 /// concrete tuple by the script before forwarding (handled more richly later).
+///
+/// `class`/`title` carry the window's resource class and caption so the daemon
+/// can match window rules. They are `#[serde(default)]` so a topology from an
+/// older script (which omitted them) still deserializes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Window {
     pub id: WindowId,
     pub output: OutputId,
     pub desktop: DesktopId,
     pub activity: ActivityId,
+    #[serde(default)]
+    pub class: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// A full snapshot of the live KWin topology.
@@ -197,6 +205,9 @@ pub enum Command {
     Focus { direction: Direction },
     /// Move the focused window toward `direction` within its cell.
     Move { direction: Direction },
+    /// Resize the focused window's tiled split in `direction`. `Left`/`Right`
+    /// shrink/grow the master area; `Up`/`Down` are reserved (no-op for now).
+    Resize { direction: Direction },
     /// Switch the focused cell to `layout`.
     SetLayout { layout: LayoutKind },
     /// Adjust the master-area ratio by `delta` (clamped to a sane range).
@@ -213,6 +224,28 @@ pub enum Command {
     Reload,
     /// Report the daemon's effective configuration.
     GetConfig,
+    /// Ask the daemon for the effective keybinding table so the script can
+    /// register shortcuts generically. The daemon owns the table; `[keys]`
+    /// overrides in the config are already applied to what it returns.
+    GetKeybindings,
+}
+
+/// One entry in the daemon-owned keybinding table.
+///
+/// The script registers each entry by its stable `id` (so user rebinds in
+/// System Settings survive reloads), using `key` as the default sequence and
+/// forwarding `command` to the daemon when the shortcut fires.
+// No `Eq`: `command` may carry a float (`MasterRatio { delta: f32 }`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Keybinding {
+    /// Stable identifier KWin uses to key the (user-overridable) shortcut.
+    pub id: String,
+    /// Human-readable description shown in System Settings.
+    pub description: String,
+    /// Default key sequence, in QKeySequence portable text (the user may rebind).
+    pub key: String,
+    /// Command forwarded to the daemon when the shortcut fires.
+    pub command: Command,
 }
 
 /// Replies sent from the daemon back to a client.
@@ -229,12 +262,22 @@ pub enum Reply {
     /// Computed window geometry for the script to apply (from
     /// [`Event::Topology`] or a control command that relayouts).
     Geometry(GeometrySet),
+    /// Like [`Reply::Geometry`], but the script must re-push a fresh
+    /// [`Event::Topology`] after applying it. Emitted when a move relocates a
+    /// window across outputs: applying the geometry physically moves the window
+    /// onto the new output, and the resync lets the daemon re-key it there from
+    /// KWin's updated `window.output` (there is no daemon→script push channel).
+    GeometryResync(GeometrySet),
     /// The window the script should activate (from [`Command::Focus`]).
     /// `None` means no neighbor exists in the requested direction.
     Focus { window: Option<WindowId> },
     /// The daemon's effective configuration (from [`Command::GetConfig`] or a
     /// successful [`Command::Reload`]).
     Config(ConfigReport),
+    /// The effective keybinding table (from [`Command::GetKeybindings`]).
+    // A struct variant (not a newtype around `Vec`): `#[serde(tag = "type")]`
+    // cannot tag a newtype variant wrapping a sequence.
+    Keybindings { bindings: Vec<Keybinding> },
     /// A request could not be served.
     Error { message: String },
 }
@@ -467,6 +510,8 @@ mod tests {
                 output: "DP-1".into(),
                 desktop: "d1".into(),
                 activity: "a1".into(),
+                class: Some("konsole".into()),
+                title: Some("Terminal".into()),
             }],
         };
         let ev = Event::Topology(topo);
@@ -505,6 +550,60 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, r#"{"type":"Focus","window":"w7"}"#);
+    }
+
+    #[test]
+    fn window_without_class_title_deserializes() {
+        // A topology from an older script omits class/title; they default to None.
+        let w: Window =
+            serde_json::from_str(r#"{"id":"w1","output":"o1","desktop":"d1","activity":"a1"}"#)
+                .unwrap();
+        assert_eq!(w.class, None);
+        assert_eq!(w.title, None);
+    }
+
+    #[tokio::test]
+    async fn round_trip_geometry_resync() {
+        let set = GeometrySet {
+            windows: vec![WindowGeometry {
+                id: "w1".into(),
+                rect: Rect {
+                    x: 1920,
+                    y: 0,
+                    width: 960,
+                    height: 1080,
+                },
+            }],
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &Reply::GeometryResync(set.clone()))
+            .await
+            .unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let got: Reply = read_frame(&mut cursor).await.unwrap();
+        assert_eq!(got, Reply::GeometryResync(set));
+    }
+
+    // A `Keybindings` reply carries a `Vec`, so it must be a struct variant:
+    // `#[serde(tag = "type")]` cannot tag a newtype variant wrapping a sequence.
+    // This round trip would panic at serialize time if it regressed to a tuple.
+    #[tokio::test]
+    async fn round_trip_keybindings() {
+        let reply = Reply::Keybindings {
+            bindings: vec![Keybinding {
+                id: "rift_focus_left".into(),
+                description: "Rift: Focus Left".into(),
+                key: "Meta+H".into(),
+                command: Command::Focus {
+                    direction: Direction::Left,
+                },
+            }],
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &reply).await.unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let got: Reply = read_frame(&mut cursor).await.unwrap();
+        assert_eq!(got, reply);
     }
 
     #[test]

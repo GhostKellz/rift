@@ -9,12 +9,16 @@
 use std::collections::{HashMap, HashSet};
 
 use rift_ipc::{
-    DesktopId, Direction, GeometrySet, LayoutKind, OutputId, ReconcileReport, Rect, Topology,
-    WindowGeometry, WindowId,
+    DesktopId, Direction, GeometrySet, Keybinding, LayoutKind, OutputId, ReconcileReport, Rect,
+    Topology, WindowGeometry, WindowId,
 };
 
-use crate::config::{BehaviorConfig, Config};
+use crate::config::{BehaviorConfig, Config, WindowRule};
+use crate::keys;
 use crate::layout::{self, LayoutParams};
+
+/// Step applied to the master ratio by a directional [`State::resize`].
+const RESIZE_STEP: f32 = 0.05;
 
 /// Sentinel id used to collapse a cell dimension (desktop or activity) when its
 /// `per_*` flag is off, so every value along that dimension shares one cell. The
@@ -30,6 +34,21 @@ pub struct CellKey {
     pub output: OutputId,
     pub desktop: DesktopId,
     pub activity: rift_ipc::ActivityId,
+}
+
+/// The outcome of [`State::move_window`].
+///
+/// Distinguishes an in-cell swap from a relocation across outputs: the latter
+/// needs the script to re-push topology so the daemon can re-key the window on
+/// its new output (see [`rift_ipc::Reply::GeometryResync`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveOutcome {
+    /// Nothing moved (no focus, or no neighbor and no adjacent output).
+    None,
+    /// Swapped with a neighbor inside the same cell.
+    Swapped,
+    /// Relocated to an adjacent output's cell; the script must resync topology.
+    CrossedOutput,
 }
 
 /// Per-cell layout state: the ordered window list and the active layout.
@@ -61,6 +80,14 @@ pub struct State {
     /// Windows the user has explicitly floated; the layout engine skips them.
     /// Pruned to the live topology on every reconcile.
     floating_windows: HashSet<WindowId>,
+    /// Window rules from config, matched on class/title each reconcile.
+    rules: Vec<WindowRule>,
+    /// Windows excluded from tiling by a matching `float` rule. Recomputed from
+    /// the topology on every reconcile (rules match live class/title, not ids).
+    ruled_float: HashSet<WindowId>,
+    /// `[keys]` overrides (binding id -> key sequence) applied over the default
+    /// table when the script asks for [`State::keybindings`].
+    key_overrides: HashMap<String, String>,
     /// The most recent topology, retained so [`State::reset`] can rebuild.
     last_topology: Topology,
 }
@@ -77,6 +104,9 @@ impl Default for State {
             behavior: BehaviorConfig::default(),
             tiling_enabled: true,
             floating_windows: HashSet::new(),
+            rules: Vec::new(),
+            ruled_float: HashSet::new(),
+            key_overrides: HashMap::new(),
             last_topology: Topology::default(),
         }
     }
@@ -113,6 +143,16 @@ impl State {
     /// 4. Materialize cells for newly present tuples with the default layout.
     /// 5. Append newly present windows to their cell in topology order.
     pub fn reconcile(&mut self, topology: &Topology) -> ReconcileReport {
+        // Guard against a transient empty topology. On resume-from-suspend or
+        // monitor hotplug, KWin can momentarily report zero outputs while it
+        // reconfigures; wiping the cell map on that blip would destroy the layout.
+        // If we had outputs last tick and now see none, hold the prior state and
+        // wait for the next non-empty topology to relayout. This is bounded to
+        // exactly that case so a first-ever empty topology still no-ops normally.
+        if topology.outputs.is_empty() && !self.last_topology.outputs.is_empty() {
+            return self.report();
+        }
+
         let outputs: HashSet<&OutputId> = topology.outputs.iter().map(|o| &o.id).collect();
         let desktops: HashSet<&DesktopId> = topology.desktops.iter().map(|d| &d.id).collect();
         let activities: HashSet<&rift_ipc::ActivityId> =
@@ -182,6 +222,23 @@ impl State {
         let live_windows: HashSet<&WindowId> = topology.windows.iter().map(|w| &w.id).collect();
         self.floating_windows.retain(|w| live_windows.contains(w));
 
+        // Recompute rule-driven floats from live class/title. Rules match window
+        // metadata, not ids, so this is rebuilt from scratch each reconcile.
+        self.ruled_float = if self.rules.is_empty() {
+            HashSet::new()
+        } else {
+            topology
+                .windows
+                .iter()
+                .filter(|w| {
+                    self.rules
+                        .iter()
+                        .any(|r| r.float && r.matches(w.class.as_deref(), w.title.as_deref()))
+                })
+                .map(|w| w.id.clone())
+                .collect()
+        };
+
         self.last_topology = topology.clone();
         self.report()
     }
@@ -217,11 +274,12 @@ impl State {
             let Some(&area) = output_rects.get(&key.output) else {
                 continue;
             };
-            // Floated windows are excluded from the layout; the rest re-tile.
+            // Floated windows (user-toggled or rule-matched) are excluded from
+            // the layout; the rest re-tile.
             let tiled: Vec<WindowId> = cell
                 .windows
                 .iter()
-                .filter(|w| !self.floating_windows.contains(*w))
+                .filter(|w| !self.floating_windows.contains(*w) && !self.ruled_float.contains(*w))
                 .cloned()
                 .collect();
             for wg in layout::arrange(cell.layout, &tiled, area, &self.params) {
@@ -272,16 +330,22 @@ impl State {
         layout::neighbor(&geoms, focused, direction)
     }
 
-    /// Swap the focused window with its directional neighbor within the same
-    /// cell, changing their layout positions. Returns whether anything moved.
-    pub fn move_window(&mut self, direction: Direction) -> bool {
+    /// Move the focused window in `direction`.
+    ///
+    /// Within a cell this swaps the window with its directional neighbor. When
+    /// the window is already at the cell's edge and a spatially adjacent output
+    /// lies that way, it is relocated onto that output's cell instead — the
+    /// [`MoveOutcome::CrossedOutput`] case the caller turns into a topology
+    /// resync. Returns what kind of move (if any) happened.
+    pub fn move_window(&mut self, direction: Direction) -> MoveOutcome {
         let Some(focused) = self.focused.clone() else {
-            return false;
+            return MoveOutcome::None;
         };
         let Some(key) = self.cell_of(&focused) else {
-            return false;
+            return MoveOutcome::None;
         };
-        // Restrict the neighbor search to this cell so a move stays local.
+        // Restrict the neighbor search to this cell so a within-cell move stays
+        // local; a missing neighbor means the window sits at the cell's edge.
         let cell_ids: HashSet<WindowId> = self.cells[&key].windows.iter().cloned().collect();
         let local: Vec<WindowGeometry> = self
             .geometry()
@@ -289,19 +353,119 @@ impl State {
             .into_iter()
             .filter(|g| cell_ids.contains(&g.id))
             .collect();
-        let Some(neighbor) = layout::neighbor(&local, &focused, direction) else {
-            return false;
-        };
 
-        let cell = self.cells.get_mut(&key).expect("focused cell exists");
-        let (Some(i), Some(j)) = (
-            cell.windows.iter().position(|w| *w == focused),
-            cell.windows.iter().position(|w| *w == neighbor),
-        ) else {
-            return false;
+        if let Some(neighbor) = layout::neighbor(&local, &focused, direction) {
+            let cell = self.cells.get_mut(&key).expect("focused cell exists");
+            let (Some(i), Some(j)) = (
+                cell.windows.iter().position(|w| *w == focused),
+                cell.windows.iter().position(|w| *w == neighbor),
+            ) else {
+                return MoveOutcome::None;
+            };
+            cell.windows.swap(i, j);
+            return MoveOutcome::Swapped;
+        }
+
+        // At the cell edge: relocate to the adjacent output that way, if any.
+        let Some(target_output) = self.adjacent_output(&key.output, direction) else {
+            return MoveOutcome::None;
         };
-        cell.windows.swap(i, j);
-        true
+        self.cells
+            .get_mut(&key)
+            .expect("focused cell exists")
+            .windows
+            .retain(|w| *w != focused);
+        let dest = CellKey {
+            output: target_output,
+            desktop: key.desktop.clone(),
+            activity: key.activity.clone(),
+        };
+        self.cells
+            .entry(dest)
+            .or_insert_with(|| Cell {
+                windows: Vec::new(),
+                layout: self.default_layout,
+            })
+            .windows
+            .push(focused);
+        MoveOutcome::CrossedOutput
+    }
+
+    /// Find the output spatially adjacent to `output` in `direction`.
+    ///
+    /// Picks from the last topology's output rectangles by comparing centers:
+    /// only outputs whose center lies that way are eligible, nearest along the
+    /// axis wins with perpendicular drift penalized. Returns `None` when no
+    /// output lies in that direction.
+    fn adjacent_output(&self, output: &OutputId, direction: Direction) -> Option<OutputId> {
+        let origin = self
+            .last_topology
+            .outputs
+            .iter()
+            .find(|o| &o.id == output)?
+            .rect;
+        let (fx, fy) = (origin.x + origin.width / 2, origin.y + origin.height / 2);
+
+        let mut best: Option<(i64, &OutputId)> = None;
+        for o in &self.last_topology.outputs {
+            if &o.id == output {
+                continue;
+            }
+            let (cx, cy) = (o.rect.x + o.rect.width / 2, o.rect.y + o.rect.height / 2);
+            let (dx, dy) = (cx - fx, cy - fy);
+            let in_dir = match direction {
+                Direction::Left => dx < 0,
+                Direction::Right => dx > 0,
+                Direction::Up => dy < 0,
+                Direction::Down => dy > 0,
+            };
+            if !in_dir {
+                continue;
+            }
+            let (along, perp) = match direction {
+                Direction::Left | Direction::Right => (dx.unsigned_abs(), dy.unsigned_abs()),
+                Direction::Up | Direction::Down => (dy.unsigned_abs(), dx.unsigned_abs()),
+            };
+            let score = along as i64 + 2 * perp as i64;
+            if best.is_none_or(|(b, _)| score < b) {
+                best = Some((score, &o.id));
+            }
+        }
+        best.map(|(_, id)| id.clone())
+    }
+
+    /// Resize the focused window's split in `direction`.
+    ///
+    /// `Left`/`Right` shrink/grow the master area (reusing the master-ratio
+    /// path, which clamps to a sane range). `Up`/`Down` are reserved — the
+    /// vertical split is layout-specific and not yet adjustable — so they
+    /// no-op. Returns whether anything changed.
+    pub fn resize(&mut self, direction: Direction) -> bool {
+        match direction {
+            Direction::Left => {
+                self.adjust_master_ratio(-RESIZE_STEP);
+                true
+            }
+            Direction::Right => {
+                self.adjust_master_ratio(RESIZE_STEP);
+                true
+            }
+            Direction::Up | Direction::Down => false,
+        }
+    }
+
+    /// The effective keybinding table: the built-in defaults with any `[keys]`
+    /// overrides applied by id. Served to the script on `GetKeybindings`.
+    pub fn keybindings(&self) -> Vec<Keybinding> {
+        let mut table = keys::defaults();
+        if !self.key_overrides.is_empty() {
+            for kb in &mut table {
+                if let Some(key) = self.key_overrides.get(&kb.id) {
+                    kb.key = key.clone();
+                }
+            }
+        }
+        table
     }
 
     /// Switch the focused cell to `layout`. Returns whether a cell was changed.
@@ -362,6 +526,8 @@ impl State {
         self.params.gaps_outer = cfg.gaps.outer;
         self.tiling_enabled = cfg.layout.tiling_enabled;
         self.behavior = cfg.behavior.clone();
+        self.rules = cfg.rules.clone();
+        self.key_overrides = cfg.keys.clone();
     }
 
     /// Snapshot the effective config for `riftctl config`/`reload`.
@@ -402,6 +568,19 @@ mod tests {
             },
         }
     }
+    /// An output placed at horizontal offset `x` (for multi-monitor tests).
+    fn output_at(id: &str, x: i32) -> Output {
+        Output {
+            id: id.into(),
+            name: id.into(),
+            rect: Rect {
+                x,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        }
+    }
     fn desktop(id: &str) -> Desktop {
         Desktop {
             id: id.into(),
@@ -420,6 +599,19 @@ mod tests {
             output: output.into(),
             desktop: desktop.into(),
             activity: activity.into(),
+            class: None,
+            title: None,
+        }
+    }
+
+    fn window_classed(id: &str, output: &str, class: &str) -> Window {
+        Window {
+            id: id.into(),
+            output: output.into(),
+            desktop: "d1".into(),
+            activity: "a1".into(),
+            class: Some(class.into()),
+            title: None,
         }
     }
 
@@ -613,7 +805,7 @@ mod tests {
     fn move_window_swaps_with_neighbor() {
         let mut state = two_window_state();
         state.set_focus(Some("w1".into()));
-        assert!(state.move_window(Direction::Right));
+        assert_eq!(state.move_window(Direction::Right), MoveOutcome::Swapped);
         assert_eq!(
             state.cells()[&key("o1", "d1", "a1")].windows,
             vec!["w2".into(), "w1".into()]
@@ -637,7 +829,7 @@ mod tests {
     fn control_without_focus_is_noop() {
         let mut state = two_window_state();
         assert_eq!(state.focus_neighbor(Direction::Right), None);
-        assert!(!state.move_window(Direction::Right));
+        assert_eq!(state.move_window(Direction::Right), MoveOutcome::None);
         assert!(!state.set_layout(LayoutKind::Monocle));
     }
 
@@ -676,6 +868,8 @@ mod tests {
                 per_activity: false,
                 focus_follows_mouse: true,
             },
+            rules: Vec::new(),
+            keys: HashMap::new(),
         };
         state.apply_config(&cfg);
 
@@ -731,6 +925,8 @@ mod tests {
                 outer: 16,
             },
             behavior: BehaviorConfig::default(),
+            rules: Vec::new(),
+            keys: HashMap::new(),
         });
         let report = state.config_report("/tmp/riftrc".into(), true);
         assert_eq!(report.layout, LayoutKind::Spiral);
@@ -798,6 +994,34 @@ mod tests {
         assert!(!state.floating_windows.contains(&"w2".into()));
     }
 
+    /// A transient empty topology (resume/hotplug blip) is ignored: the cell map
+    /// and geometry survive, and the next non-empty topology relayouts.
+    #[test]
+    fn empty_topology_preserves_prior_cells() {
+        let mut state = two_window_state();
+        let before = state.geometry().windows.len();
+        assert_eq!(before, 2);
+
+        // Zero outputs mid-reconfigure: held, not wiped.
+        let report = state.reconcile(&Topology::default());
+        assert_eq!(report.cells, 1, "prior cell is held across the empty blip");
+        assert_eq!(report.windows, 2);
+        assert_eq!(state.geometry().windows.len(), 2, "geometry survives");
+
+        // Outputs return: the layout reconciles normally again.
+        state.reconcile(&Topology {
+            outputs: vec![output("o1")],
+            desktops: vec![desktop("d1")],
+            activities: vec![activity("a1")],
+            windows: vec![window("w1", "o1", "d1", "a1")],
+        });
+        assert_eq!(
+            state.geometry().windows.len(),
+            1,
+            "relayouts after recovery"
+        );
+    }
+
     /// `apply_config` carries `tiling_enabled` through to the running state.
     #[test]
     fn apply_config_sets_tiling_enabled() {
@@ -813,6 +1037,8 @@ mod tests {
             },
             gaps: GapsConfig::default(),
             behavior: BehaviorConfig::default(),
+            rules: Vec::new(),
+            keys: HashMap::new(),
         });
         assert!(state.geometry().windows.is_empty());
     }
@@ -835,6 +1061,8 @@ mod tests {
                 per_activity,
                 focus_follows_mouse: false,
             },
+            rules: Vec::new(),
+            keys: HashMap::new(),
         });
         state
     }
@@ -919,6 +1147,158 @@ mod tests {
             ],
         });
         assert_eq!(state.window_count(), 1);
+    }
+
+    /// A window matching a `float` rule is excluded from tiling; others tile.
+    #[test]
+    fn float_rule_excludes_matched_window_from_layout() {
+        use crate::config::{BehaviorConfig, Config, GapsConfig, LayoutConfig, WindowRule};
+
+        let mut state = State::default();
+        state.apply_config(&Config {
+            layout: LayoutConfig {
+                default: LayoutKind::Tile,
+                master_ratio: 0.6,
+                master_count: 1,
+                tiling_enabled: true,
+            },
+            gaps: GapsConfig::default(),
+            behavior: BehaviorConfig::default(),
+            rules: vec![WindowRule {
+                class: Some("pavucontrol".into()),
+                title: None,
+                float: true,
+            }],
+            keys: HashMap::new(),
+        });
+        state.reconcile(&Topology {
+            outputs: vec![output("o1")],
+            desktops: vec![desktop("d1")],
+            activities: vec![activity("a1")],
+            windows: vec![
+                window_classed("w1", "o1", "konsole"),
+                window_classed("w2", "o1", "pavucontrol"),
+            ],
+        });
+
+        // Both windows are managed (in the cell), but only w1 gets geometry.
+        assert_eq!(state.window_count(), 2);
+        let geom = state.geometry();
+        assert_eq!(geom.windows.len(), 1);
+        assert_eq!(geom.windows[0].id, "w1".into());
+    }
+
+    /// A window at its cell's edge moves onto the spatially adjacent output,
+    /// landing in that output's cell with geometry inside its rectangle.
+    #[test]
+    fn move_at_cell_edge_crosses_to_adjacent_output() {
+        let mut state = State::default();
+        state.reconcile(&Topology {
+            outputs: vec![output_at("o1", 0), output_at("o2", 1920)],
+            desktops: vec![desktop("d1")],
+            activities: vec![activity("a1")],
+            windows: vec![window("w1", "o1", "d1", "a1")],
+        });
+        state.set_focus(Some("w1".into()));
+
+        // The lone window has no in-cell neighbor; moving right crosses to o2.
+        assert_eq!(
+            state.move_window(Direction::Right),
+            MoveOutcome::CrossedOutput
+        );
+
+        // w1 now lives in o2's cell and lays out within o2's rectangle.
+        assert!(
+            state.cells()[&key("o2", "d1", "a1")]
+                .windows
+                .contains(&"w1".into())
+        );
+        let geom = state.geometry();
+        let wg = geom
+            .windows
+            .iter()
+            .find(|g| g.id == "w1".into())
+            .expect("moved window has geometry");
+        assert!(wg.rect.x >= 1920, "window placed on the right output");
+    }
+
+    /// A move toward an edge with no output that way leaves the window put.
+    #[test]
+    fn move_at_edge_without_adjacent_output_is_noop() {
+        let mut state = State::default();
+        state.reconcile(&Topology {
+            outputs: vec![output_at("o1", 0), output_at("o2", 1920)],
+            desktops: vec![desktop("d1")],
+            activities: vec![activity("a1")],
+            windows: vec![window("w1", "o1", "d1", "a1")],
+        });
+        state.set_focus(Some("w1".into()));
+        // Nothing lies left of o1.
+        assert_eq!(state.move_window(Direction::Left), MoveOutcome::None);
+        assert!(
+            state.cells()[&key("o1", "d1", "a1")]
+                .windows
+                .contains(&"w1".into())
+        );
+    }
+
+    /// Resize Left/Right move the master ratio; Up/Down are reserved no-ops.
+    #[test]
+    fn resize_adjusts_master_ratio_left_right_only() {
+        let mut state = State::default();
+        let base = state.params.master_ratio;
+
+        assert!(state.resize(Direction::Right));
+        assert!(state.params.master_ratio > base);
+        let grown = state.params.master_ratio;
+
+        assert!(state.resize(Direction::Left));
+        assert!(state.params.master_ratio < grown);
+
+        let before = state.params.master_ratio;
+        assert!(!state.resize(Direction::Up));
+        assert!(!state.resize(Direction::Down));
+        assert_eq!(
+            state.params.master_ratio, before,
+            "vertical resize is reserved"
+        );
+    }
+
+    /// `[keys]` overrides replace a binding's key by id; others keep defaults.
+    #[test]
+    fn keybindings_apply_config_overrides() {
+        use crate::config::{BehaviorConfig, Config, GapsConfig, LayoutConfig};
+
+        let mut state = State::default();
+        // Defaults out of the box.
+        let default_left = state
+            .keybindings()
+            .into_iter()
+            .find(|b| b.id == "rift_focus_left")
+            .unwrap()
+            .key;
+        assert_eq!(default_left, "Meta+H");
+
+        let mut keys = HashMap::new();
+        keys.insert("rift_focus_left".to_string(), "Meta+Left".to_string());
+        state.apply_config(&Config {
+            layout: LayoutConfig {
+                default: LayoutKind::Tile,
+                master_ratio: 0.6,
+                master_count: 1,
+                tiling_enabled: true,
+            },
+            gaps: GapsConfig::default(),
+            behavior: BehaviorConfig::default(),
+            rules: Vec::new(),
+            keys,
+        });
+
+        let table = state.keybindings();
+        let left = table.iter().find(|b| b.id == "rift_focus_left").unwrap();
+        assert_eq!(left.key, "Meta+Left", "override applied");
+        let right = table.iter().find(|b| b.id == "rift_focus_right").unwrap();
+        assert_eq!(right.key, "Meta+L", "untouched binding keeps its default");
     }
 
     /// Focus cannot survive its window being removed from the topology.

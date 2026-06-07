@@ -1,0 +1,22 @@
+post_install() {
+    cat <<'EOF'
+==> rift installed.
+
+    Finish the per-user setup (enables the KWin script, frees Meta+L, and
+    starts the daemon via systemd --user):
+
+        riftctl setup
+
+    Then add the pager: right-click a panel -> Add Widgets -> "Rift Pager".
+EOF
+}
+
+post_upgrade() {
+    cat <<'EOF'
+==> rift upgraded.
+
+    If shortcuts or the script misbehave after the upgrade, re-run:
+
+        riftctl setup
+EOF
+}

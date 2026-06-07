@@ -6,11 +6,9 @@
 // arrive in M2/M3 once the in-KWin transport is settled (see tasks/spec.md).
 
 import {
-  Command,
-  Direction,
   GeometrySet,
   Hello,
-  LayoutKind,
+  Keybinding,
   PROTOCOL_VERSION,
   Reply,
   Topology,
@@ -52,6 +50,8 @@ export function collectTopology(): Topology {
         output: w.output.name,
         desktop: w.desktops.length > 0 ? w.desktops[0].id : ALL,
         activity: w.activities.length > 0 ? w.activities[0] : ALL,
+        class: w.resourceClass,
+        title: w.caption,
       })),
   };
 }
@@ -83,16 +83,28 @@ export function start(transport: Transport, kwinVersion: string): () => void {
         if (!helloAcked) {
           helloAcked = true;
           print("[rift] daemon acknowledged hello");
-          registerKeybindings(transport);
+          // The daemon owns the keybinding table (defaults overlaid by the
+          // user's `[keys]`); fetch it and register each entry generically.
+          transport.send({ type: "GetKeybindings" });
           reportFocus(transport);
           pushTopology(transport);
         }
+        break;
+      case "Keybindings":
+        registerKeybindings(transport, reply.bindings);
         break;
       case "Reconciled":
         print(`[rift] reconciled: ${reply.cells} cells, ${reply.windows} windows`);
         break;
       case "Geometry":
         applyGeometry(reply);
+        break;
+      case "GeometryResync":
+        // A cross-output move: apply the geometry (which physically relocates
+        // the window), then re-push topology so the daemon re-keys it on its
+        // new output from KWin's updated state.
+        applyGeometry(reply);
+        pushTopology(transport);
         break;
       case "Focus":
         focusWindow(reply.window);
@@ -116,119 +128,21 @@ export function start(transport: Transport, kwinVersion: string): () => void {
   };
 }
 
-/** Default keybindings: command sent to the daemon for each shortcut. */
-interface Binding {
-  /** Stable identifier KWin uses to key the (user-overridable) shortcut. */
-  id: string;
-  /** Human-readable description shown in System Settings. */
-  text: string;
-  /** Default key sequence (the user may rebind it). */
-  key: string;
-  /** Command forwarded to the daemon when the shortcut fires. */
-  command: Command;
-}
-
-/** vim-style focus/move plus layout and master-area controls. */
-const BINDINGS: Binding[] = [
-  focusBind("h", "Left"),
-  focusBind("j", "Down"),
-  focusBind("k", "Up"),
-  focusBind("l", "Right"),
-  moveBind("h", "Left"),
-  moveBind("j", "Down"),
-  moveBind("k", "Up"),
-  moveBind("l", "Right"),
-  // Tile (Meta+T) and ThreeColumn (Meta+D) collide with KDE defaults
-  // (Show Desktop et al.), which KGlobalAccel silently drops — use Shift.
-  layoutBind("t", "Tile", "Meta+Shift+T"),
-  layoutBind("m", "Monocle"),
-  layoutBind("c", "Columns"),
-  layoutBind("s", "Spiral"),
-  layoutBind("d", "ThreeColumn", "Meta+Shift+D"),
-  layoutBind("f", "Floating"),
-  {
-    id: "rift_toggle_tiling",
-    text: "Rift: Toggle auto-tiling",
-    key: "Meta+Y",
-    command: { type: "ToggleTiling" },
-  },
-  {
-    // Meta+G is KDE's "Toggle Grid View"; Meta+Shift+Space is free and matches
-    // the i3/sway float-toggle convention.
-    id: "rift_toggle_float",
-    text: "Rift: Toggle float (focused)",
-    key: "Meta+Shift+Space",
-    command: { type: "ToggleFloat", window: null },
-  },
-  {
-    // Meta+Minus/Equal are KDE's "Zoom Out/In" (desktop zoom); use Shift to
-    // match master_count on Meta+Shift+Comma/Period and avoid the collision.
-    // Use the literal "-"/"=" glyphs: QKeySequence has no "Minus"/"Equal" key
-    // names, so those strings parse to Qt::Key_unknown and never bind.
-    id: "rift_master_ratio_dec",
-    text: "Rift: Shrink master area",
-    key: "Meta+Shift+-",
-    command: { type: "MasterRatio", delta: -0.05 },
-  },
-  {
-    id: "rift_master_ratio_inc",
-    text: "Rift: Grow master area",
-    key: "Meta+Shift+=",
-    command: { type: "MasterRatio", delta: 0.05 },
-  },
-  {
-    // Glyphs, not "Comma"/"Period": QKeySequence portable text has no key names
-    // for punctuation, so the words parse to an empty/unknown sequence.
-    id: "rift_master_count_dec",
-    text: "Rift: Fewer master windows",
-    key: "Meta+Shift+,",
-    command: { type: "MasterCount", delta: -1 },
-  },
-  {
-    id: "rift_master_count_inc",
-    text: "Rift: More master windows",
-    key: "Meta+Shift+.",
-    command: { type: "MasterCount", delta: 1 },
-  },
-];
-
-function focusBind(letter: string, direction: Direction): Binding {
-  return {
-    id: `rift_focus_${direction.toLowerCase()}`,
-    text: `Rift: Focus ${direction}`,
-    key: `Meta+${letter.toUpperCase()}`,
-    command: { type: "Focus", direction },
-  };
-}
-
-function moveBind(letter: string, direction: Direction): Binding {
-  return {
-    id: `rift_move_${direction.toLowerCase()}`,
-    text: `Rift: Move window ${direction}`,
-    key: `Meta+Shift+${letter.toUpperCase()}`,
-    command: { type: "Move", direction },
-  };
-}
-
-function layoutBind(letter: string, layout: LayoutKind, key?: string): Binding {
-  return {
-    id: `rift_layout_${layout.toLowerCase()}`,
-    text: `Rift: ${layout} layout`,
-    key: key ?? `Meta+${letter.toUpperCase()}`,
-    command: { type: "SetLayout", layout },
-  };
-}
-
 /**
- * Register the default shortcuts, each forwarding its command to the daemon.
- * KWin keys overrides by the binding `id`, so user rebinds in System Settings
- * survive script reloads.
+ * Register the daemon-supplied shortcuts, each forwarding its command to the
+ * daemon. The daemon is the single source of truth for the table (defaults plus
+ * the user's `riftrc [keys]` overrides); the script holds no binding list of its
+ * own. KWin keys overrides by the binding `id`, so user rebinds in System
+ * Settings survive script reloads — the daemon keeps ids stable for that reason.
  */
-export function registerKeybindings(transport: Transport): void {
-  for (const b of BINDINGS) {
-    registerShortcut(b.id, b.text, b.key, () => transport.send(b.command));
+export function registerKeybindings(
+  transport: Transport,
+  bindings: Keybinding[],
+): void {
+  for (const b of bindings) {
+    registerShortcut(b.id, b.description, b.key, () => transport.send(b.command));
   }
-  print(`[rift] registered ${BINDINGS.length} shortcuts`);
+  print(`[rift] registered ${bindings.length} shortcuts`);
 }
 
 /**

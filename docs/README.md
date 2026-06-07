@@ -34,8 +34,11 @@ compositor events to the daemon and applies the geometry it computes.
 
 ## Operating
 
+- [install.md](install.md) — Arch (AUR) install, `riftctl setup`, and the dev path.
 - [troubleshooting/diagnostics.md](troubleshooting/diagnostics.md) — when a session
   isn't tiling.
+- [troubleshooting/reliability.md](troubleshooting/reliability.md) — behavior across
+  daemon restart, suspend/resume, and monitor hotplug.
 - [building.md](building.md) — building from source and installing the KWin script.
 
 ## Project layout

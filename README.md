@@ -20,6 +20,14 @@
 
 ---
 
+> **Status: experimental — a concept, not a daily driver.**
+> I primarily use [krohnkite](https://github.com/esjeon/krohnkite) day to day.
+> Rift is me tinkering with a different shape: take the things I like about
+> krohnkite's tiling and pair them with what I like about COSMIC's approach, but
+> move the layout engine into a standalone Rust daemon instead of an
+> in-compositor script. Treat it as a playground for that idea — expect rough
+> edges and breaking changes.
+
 ## Overview
 
 Rift is a dynamic tiling window manager for KDE Plasma on Wayland. Inspired by

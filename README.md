@@ -187,8 +187,9 @@ focus_follows_mouse = false
 
 | Document | Description |
 |----------|-------------|
-| [Architecture](docs/architecture.md) | Daemon ↔ KWin protocol, cell model, reconciliation |
-| [Configuration](docs/configuration.md) | Full `riftrc` reference |
-| [Keybindings](docs/keybindings.md) | Default bindings and customization |
-| [Layouts](docs/layouts.md) | Available layouts and behavior |
-| [Troubleshooting](docs/troubleshooting.md) | Recovery and diagnostics |
+| [Documentation index](docs/README.md) | Full table of contents |
+| [Architecture](docs/architecture/overview.md) | Daemon ↔ KWin protocol, cell model, reconciliation |
+| [Configuration](docs/config/reference.md) | Full `riftrc` reference |
+| [Keybindings](docs/usage/keybindings.md) | Default bindings and customization |
+| [Layouts](docs/layouts/overview.md) | Available layouts and behavior |
+| [Troubleshooting](docs/troubleshooting/diagnostics.md) | Recovery and diagnostics |

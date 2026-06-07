@@ -2,6 +2,9 @@
 pkgname=rift
 pkgver=0.1.0
 pkgrel=1
+# Source is pinned to a commit until a tagged release exists. Swap `source` to
+# the tag tarball (and rerun updpkgsums) once v$pkgver is published.
+_commit=a848046b9f44863c66b1d6d4e7b5ca690b51de11
 pkgdesc="Tiling window manager daemon for KDE Plasma 6 / KWin"
 arch=('x86_64')
 url="https://github.com/ghostkellz/rift"
@@ -11,19 +14,19 @@ makedepends=('cargo' 'npm')
 optdepends=('kwin: in-KWin tiling (the rift-kwin script)'
             'plasma-workspace: riftctl setup (kwriteconfig6/qdbus6/gdbus surgery)'
             'plasma-desktop: add the Rift Pager widget to a panel')
-source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/$_commit.tar.gz")
+sha256sums=('d8dc62908a456d3e3891a2d8f2d67ec3c91cabf8339526dd349c9cc7b41ada23')
 install="$pkgname.install"
 
 prepare() {
-    cd "$pkgname-$pkgver"
+    cd "$pkgname-$_commit"
     # Vendor crates so build() can run offline (--frozen).
     export CARGO_HOME="$srcdir/cargo-home"
     cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-    cd "$pkgname-$pkgver"
+    cd "$pkgname-$_commit"
     export CARGO_HOME="$srcdir/cargo-home"
     # Use the distro toolchain rather than the repo's pinned rustup channel.
     export RUSTUP_TOOLCHAIN=stable
@@ -37,7 +40,7 @@ build() {
 }
 
 check() {
-    cd "$pkgname-$pkgver"
+    cd "$pkgname-$_commit"
     export CARGO_HOME="$srcdir/cargo-home"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
@@ -45,7 +48,7 @@ check() {
 }
 
 package() {
-    cd "$pkgname-$pkgver"
+    cd "$pkgname-$_commit"
 
     # Daemon and CLI.
     install -Dm755 "target/release/riftd" "$pkgdir/usr/bin/riftd"
